@@ -39,6 +39,7 @@ def fm_calls(tmp):
 
 def load_afm_module():
     mod = type(sys)("afm_mod")
+    mod.__file__ = AFM
     with open(AFM) as f:
         exec(compile(f.read(), AFM, "exec"), mod.__dict__)
     return mod
@@ -263,6 +264,66 @@ class SignalTests(unittest.TestCase):
         self.assertIn("interrupted", err)
         RespondTests.assert_gone(self, child)
         self.assertFalse(any(n.endswith(".json") for n in os.listdir(tmp)), "temp schema should be removed")
+
+
+class SchemaTests(unittest.TestCase):
+    def test_classify_schema_fields(self):
+        tmp = tempfile.mkdtemp()
+        run_afm(["classify", "--labels", "bug, feature ,question"], stdin="x", tmp=tmp,
+                env={"FAKEFM_RESPOND_STDOUT": '{"label": "bug"}'})
+        r = [c for c in fm_calls(tmp) if c["cmd"][0] == "respond"][0]
+        path = r["cmd"][r["cmd"].index("--schema") + 1]
+        mod = load_afm_module()
+        s = mod.classify_schema(["bug", "feature", "question"])
+        self.assertEqual(s, {
+            "title": "Classification", "type": "object",
+            "properties": {"label": {"type": "string", "enum": ["bug", "feature", "question"]}},
+            "required": ["label"], "x-order": ["label"], "additionalProperties": False})
+        self.assertTrue(path.endswith(".json"))
+        self.assertFalse(os.path.exists(path), "temp schema removed after exit")
+
+    def test_classify_instructions_have_labels(self):
+        tmp = tempfile.mkdtemp()
+        run_afm(["classify", "--labels", "bug,feature"], stdin="x", tmp=tmp, env={"FAKEFM_RESPOND_STDOUT": '{"label": "bug"}'})
+        cmd = [c for c in fm_calls(tmp) if c["cmd"][0] == "respond"][0]["cmd"]
+        self.assertIn("bug, feature", cmd[cmd.index("-i") + 1])
+
+    def test_classify_output_is_compact_json(self):
+        p = run_afm(["classify", "--labels", "bug,feature"], stdin="x", env={"FAKEFM_RESPOND_STDOUT": '{ "label" : "feature" }'})
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertEqual(p.stdout, '{"label":"feature"}\n')
+
+    def test_classify_label_outside_list_is_exit_3(self):
+        p = run_afm(["classify", "--labels", "bug,feature"], stdin="x", env={"FAKEFM_RESPOND_STDOUT": '{"label": "other"}'})
+        self.assertEqual(p.returncode, 3)
+        self.assertEqual(p.stdout, "")
+        self.assertIn("other", p.stderr)
+
+    def test_invalid_json_is_exit_3_with_raw_on_stderr(self):
+        p = run_afm(["classify", "--labels", "bug,feature"], stdin="x", env={"FAKEFM_RESPOND_STDOUT": "not json {"})
+        self.assertEqual(p.returncode, 3)
+        self.assertEqual(p.stdout, "")
+        self.assertIn("not json {", p.stderr)
+
+    def test_extract_uses_given_schema_and_compacts(self):
+        tmp = tempfile.mkdtemp()
+        schema = os.path.join(tmp, "s.json")
+        with open(schema, "w") as f:
+            json.dump({"type": "object"}, f)
+        p = run_afm(["extract", "--schema", schema], stdin="x", tmp=tmp, env={"FAKEFM_RESPOND_STDOUT": '{"a": 1,\n "b": "two"}'})
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertEqual(p.stdout, '{"a":1,"b":"two"}\n')
+        cmd = [c for c in fm_calls(tmp) if c["cmd"][0] == "respond"][0]["cmd"]
+        self.assertEqual(cmd[cmd.index("--schema") + 1], schema)
+        self.assertTrue(os.path.exists(schema), "user schema must not be deleted")
+
+    def test_ask_with_schema(self):
+        tmp = tempfile.mkdtemp()
+        schema = os.path.join(tmp, "s.json")
+        with open(schema, "w") as f:
+            json.dump({"type": "object"}, f)
+        p = run_afm(["ask", "Extract.", "--schema", schema], stdin="x", tmp=tmp, env={"FAKEFM_RESPOND_STDOUT": '{"k": true}'})
+        self.assertEqual(p.stdout, '{"k":true}\n')
 
 
 if __name__ == "__main__":

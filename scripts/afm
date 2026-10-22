@@ -5,10 +5,12 @@ Exit codes: 0 ok, 1 fm failed, 2 usage, 3 bad JSON or label, 4 fm missing or
 model unavailable, 5 blocked by a sandbox, 6 input over budget.
 """
 import argparse
+import json
 import os
 import signal
 import subprocess
 import sys
+import tempfile
 
 EXIT_OK, EXIT_FM, EXIT_USAGE, EXIT_JSON, EXIT_UNAVAILABLE, EXIT_SANDBOX, EXIT_BUDGET = 0, 1, 2, 3, 4, 5, 6
 
@@ -190,6 +192,39 @@ def respond(job, text, args, schema_path):
     return out
 
 
+def classify_schema(labels):
+    return {
+        "title": "Classification",
+        "type": "object",
+        "properties": {"label": {"type": "string", "enum": list(labels)}},
+        "required": ["label"],
+        "x-order": ["label"],
+        "additionalProperties": False,
+    }
+
+
+def write_temp_schema(obj):
+    fd, path = tempfile.mkstemp(prefix="afm-schema-", suffix=".json")
+    _TEMP_FILES.append(path)
+    with os.fdopen(fd, "w") as f:
+        json.dump(obj, f)
+    return path
+
+
+def parse_answer(raw, job, schema_path):
+    if not schema_path:
+        return raw.rstrip()
+    try:
+        obj = json.loads(raw)
+    except ValueError:
+        raise AfmError(EXIT_JSON, "model output is not valid JSON:\n%s" % raw.rstrip())
+    if job.labels is not None:
+        label = obj.get("label") if isinstance(obj, dict) else None
+        if label not in job.labels:
+            raise AfmError(EXIT_JSON, "label %r is not one of %s" % (label, ", ".join(job.labels)))
+    return json.dumps(obj, separators=(",", ":"), ensure_ascii=False)
+
+
 def cleanup():
     while _TEMP_FILES:
         path = _TEMP_FILES.pop()
@@ -232,11 +267,13 @@ def main(argv):
         job = resolve_job(args)
         text = read_input()
         schema_path = job.schema_path
+        if job.labels is not None:
+            schema_path = write_temp_schema(classify_schema(job.labels))
         overhead = schema_tokens(schema_path) if schema_path else 0
         total = count_tokens(text, job.instructions) + overhead
         check_budget(total, args.budget, args.chunk)
         answer = respond(job, text, args, schema_path)
-        emit_text(answer)
+        emit_text(parse_answer(answer, job, schema_path))
         return EXIT_OK
     except AfmError as e:
         sys.stderr.write("afm: %s\n" % e.message)
