@@ -1,16 +1,48 @@
 # afmux
 
-Pipe command output or a file into `afm` and get back a short answer from the
-free on-device Apple Foundation Model, without the text ever entering your
-coding agent's context or leaving the machine.
+An implementer for coding agents that runs on the free on-device Apple
+Foundation Model. The agent (Claude Code, Codex, OpenCode) breaks a task into
+small test-gated steps and writes each step's spec and tests; `afm run`
+implements each step on the local model, runs its tests, retries once, and
+reports back once. The agent reads test results, never passing code, and the
+code is written on the machine.
 
-    pytest 2>&1 | afm ask "list each failing test and its error, one per line"
-    git diff --cached | afm commit-msg
-    afm extract --schema s.json < build.log
+```
+afm run steps/
+```
 
-afmux is a skill for Claude Code, Codex and OpenCode plus one Python script.
-There is no daemon, server or queue. The design and its measurements are in
-[`docs/superpowers/specs/2026-10-22-afmux-design.md`](docs/superpowers/specs/2026-10-22-afmux-design.md).
+```
+step            file          result  attempts
+01-parse-date   src/util.py   pass    1
+02-slugify      src/util.py   pass    1
+03-log-line     src/log.py    FAIL    2
+
+step 03-log-line failed after 2 attempts
+test: python3 -m unittest tests.test_log
+...
+attempt saved at src/log.py.afm-failed; src/log.py restored
+```
+
+## What to expect
+
+Measured on 2026-10-22 with seven single-function specs, hidden tests and one
+retry, the same specs given to two cloud models for comparison:
+
+| implementer | tasks fully passed | tests passed | time | cost |
+|---|---|---|---|---|
+| on-device model via `afm` | 4 of 7 | 37 of 48 | 30 s | $0 |
+| Claude Haiku 5.5 | 7 of 7 | 48 of 48 | 30 s | $0.010 |
+| Claude Sonnet 5.5 | 7 of 7 | 48 of 48 | 28 s | $0.037 |
+
+The on-device model passed every step whose logic was a direct transcription
+of the spec, including an edit to an existing module. It failed on padding
+rules, an off-by-one field count and digit-width validation, and did not
+repair them from the failing tests. Rerunning the same seven specs through
+`afm run` gave 3 of 7: with greedy decoding, small wording differences in the
+prompt flip individual steps. So afmux is not a cost tool: a Haiku subagent
+did the same work for a cent. It is for code that must stay on the machine,
+and for the spec-plus-tests handoff discipline, with the agent expecting
+about half the steps to come back to it.
 
 ## Requirements
 
@@ -21,21 +53,18 @@ There is no daemon, server or queue. The design and its measurements are in
 
 ## Install
 
-One line:
-
 ```bash
 curl -fsSL https://raw.githubusercontent.com/antvinni/afmux/main/install.sh | bash
 ```
 
 It checks the requirements, clones afmux into `~/.afmux` (or updates it),
 puts `afm` on your `PATH` via `~/.local/bin`, links the skill into
-`~/.claude/skills` and `~/.agents/skills`, and, for each agent it finds
-installed, adds the standing rule below and the sandbox or permission
-setting from the sections below. It is safe to run again. Set `AFMUX_DIR` to
-choose the checkout location, or run `./install.sh` from a clone to use that
-clone in place. Nothing it does is hidden: read it first if you prefer.
+`~/.claude/skills` and `~/.agents/skills`, and for each agent it finds adds
+the standing rule and the sandbox or permission setting below. Safe to run
+again. Set `AFMUX_DIR` to choose the checkout location, or run `./install.sh`
+from a clone to use that clone in place.
 
-By hand, the same thing is:
+By hand:
 
 ```bash
 git clone https://github.com/antvinni/afmux ~/.afmux
@@ -43,110 +72,82 @@ mkdir -p ~/.local/bin && ln -sf ~/.afmux/scripts/afm ~/.local/bin/afm   # ~/.loc
 mkdir -p ~/.claude/skills ~/.agents/skills
 ln -sfn ~/.afmux ~/.claude/skills/afmux    # Claude Code (OpenCode reads this too)
 ln -sfn ~/.afmux ~/.agents/skills/afmux    # Codex (OpenCode reads this too)
-afm --list
 ```
 
-Skill locations, as documented by each agent:
+Skill locations: Claude Code reads `~/.claude/skills/`
+([docs](https://code.claude.com/docs/en/skills)); Codex reads
+`~/.agents/skills/` ([docs](https://learn.chatgpt.com/docs/build-skills));
+OpenCode reads `~/.config/opencode/skills/` and both of the others
+([docs](https://opencode.ai/docs/skills/)).
 
-| agent | user-level skills directory | docs |
+## Step files
+
+A step is one markdown file; a run is a directory of them, executed in
+filename order.
+
+```
+file: src/util.py
+test: python3 -m unittest tests.test_util
+context: src/types.py, src/errors.py
+---
+Write a Python function `parse_date(s)` ...
+```
+
+| key | required | meaning |
 |---|---|---|
-| Claude Code | `~/.claude/skills/` | [Skills](https://code.claude.com/docs/en/skills) |
-| Codex | `~/.agents/skills/` | [Build skills](https://learn.chatgpt.com/docs/build-skills) |
-| OpenCode | `~/.config/opencode/skills/`, and it also reads `~/.claude/skills/` and `~/.agents/skills/` | [Skills](https://opencode.ai/docs/skills/) |
+| `file` | yes | the one file the step creates or rewrites, relative to where `afm` runs |
+| `test` | yes | shell command run from the same directory; exit 0 means the step passed |
+| `context` | no | files shown to the model as read-only reference, such as interfaces from earlier steps |
 
-The script is invoked as plain `afm`, so the agent never has to know where
-the skill directory is.
-
-## Tell the agent when to use it
-
-Skill descriptions alone trigger weakly for a tool whose point is saving
-tokens. The installer adds this standing rule to `~/.claude/CLAUDE.md`,
-`~/.codex/AGENTS.md` and `~/.config/opencode/AGENTS.md` for the agents it
-finds; to add it by hand, or per project, put it in your `CLAUDE.md` (Claude
-Code) or `AGENTS.md` (Codex, OpenCode):
-
-```
-When you need only a summary, a label, some fields or a commit message from command output or a file, pipe it into `afm` (see the afmux skill) instead of reading it yourself.
-```
-
-You can also invoke it by name: `/afmux` in Claude Code, `$afmux` in Codex,
-or "use afm for this" anywhere.
-
-## Let `afm` reach the model from inside the agent's sandbox
-
-Inside a sandboxed shell, `fm available` succeeds but `fm respond` and
-`fm count-tokens` fail with `ModelManagerServices.ModelManagerError error
-1008`. `afm` reports that as exit 5 and tells the agent to run it outside the
-sandbox.
-
-**Claude Code.** The installer adds `afm` to the sandbox exclusions in
-`~/.claude/settings.json`; by hand:
-
-```json
-{
-  "sandbox": {
-    "excludedCommands": ["afm *"]
-  }
-}
-```
-
-Two documented limits of `excludedCommands` matter here: every command in
-the call must match, and a redirect or command substitution keeps the whole
-call sandboxed. So `pytest 2>&1 | afm ask "..."` and `afm summarise <
-build.log` still run sandboxed even with the entry above, which only helps
-calls like `afm --list`. When a call is sandboxed, `afm` exits 5 and the
-skill tells Claude to rerun the same command with `dangerouslyDisableSandbox:
-true`; the prompt is titled "Bash command (unsandboxed)", and in auto and
-bypass modes it runs without a prompt. See
-[Sandboxing](https://code.claude.com/docs/en/sandboxing).
-
-**Codex.** Codex has no per-command exclusion. Either approve the sandbox
-escalation when Codex asks, or run with `--sandbox danger-full-access` for
-sessions that use `afm`. See [Agent approvals and
-security](https://learn.chatgpt.com/docs/agent-approvals-security).
-
-**OpenCode.** OpenCode gates commands with permission rules rather than an
-OS sandbox. The installer allows the pattern in
-`~/.config/opencode/opencode.json`; by hand:
-
-```json
-{
-  "permission": {
-    "shell": {
-      "afm *": "allow"
-    }
-  }
-}
-```
-
-See [Permissions](https://opencode.ai/docs/permissions/).
-
-## Optional: nudge hook for Claude Code
-
-`hooks/nudge-large-output` is a PostToolUse hook. When a Bash result is over
-a threshold (default 3000 tokens, set `AFMUX_NUDGE_TOKENS` to change it), it
-tells Claude that piping into `afm` would have been cheaper. It fires at the
-moment of waste, which no other trigger does. Add to `~/.claude/settings.json`:
-
-```json
-{
-  "hooks": {
-    "PostToolUse": [
-      {
-        "matcher": "Bash",
-        "hooks": [{"type": "command", "command": "~/.claude/skills/afmux/hooks/nudge-large-output"}]
-      }
-    ]
-  }
-}
-```
+The body is the spec. [`SKILL.md`](SKILL.md) says what a good one contains:
+signature, behaviour, examples, every edge case, and nothing the model has to
+infer. Tests are never shown to the model.
 
 ## Commands and exit codes
 
-See [`SKILL.md`](SKILL.md): presets, options, the exit-code table and what
-the agent should do on each code. In short: 0 answer, 1 model failed, 2 usage,
-3 bad JSON, 4 model unavailable, 5 sandbox, 6 input over budget (rerun with
-`--chunk`).
+```
+afm run <steps-dir> [--retries N] [--timeout S] [--budget T] [--json]
+afm step <step-file> [same options]
+```
+
+| exit | meaning |
+|---|---|
+| 0 | every step passed |
+| 1 | a step failed after its retries, or the model errored on it; the report has the test output and the saved attempt |
+| 2 | bad step file or arguments |
+| 4 | `fm` missing or model unavailable |
+| 5 | blocked by the agent's sandbox |
+| 6 | a step's prompt is over the token budget; split it |
+
+On a final failure the original file is restored (or a newly created one
+removed) and the last attempt is kept at `<file>.afm-failed`.
+
+## Tell the agent when to use it
+
+The installer adds this to `~/.claude/CLAUDE.md`, `~/.codex/AGENTS.md` and
+`~/.config/opencode/AGENTS.md` for the agents it finds; per project, put it
+in `CLAUDE.md` or `AGENTS.md`:
+
+```
+For mechanical implementation work that tests can judge, break it into small steps with a spec and a test each and run them with `afm run` (see the afmux skill) instead of writing the code yourself.
+```
+
+Or invoke it by name: `/afmux` in Claude Code, `$afmux` in Codex.
+
+## Sandboxes
+
+Inside a sandboxed shell, `fm` fails with `ModelManagerServices.ModelManagerError
+error 1008` and `afm` exits 5. Because `afm run` takes arguments and never a
+pipe or redirect, one exclusion entry is enough in Claude Code
+(`~/.claude/settings.json`, added by the installer):
+
+```json
+{"sandbox": {"excludedCommands": ["afm *"]}}
+```
+
+Codex has no per-command exclusion: approve the escalation or run with
+`--sandbox danger-full-access`. OpenCode gates commands with permission rules,
+not an OS sandbox; the installer allows `afm *` under `permission.shell`.
 
 ## Tests
 
@@ -154,13 +155,9 @@ the agent should do on each code. In short: 0 answer, 1 model failed, 2 usage,
 python3 -m unittest discover tests
 ```
 
-The suite runs against a fake `fm` on `PATH` and needs no model. It covers
-the script, the hook and the installer (which it runs against a throwaway
-`HOME`). One
-integration test runs only when the real model answers, and skips otherwise.
-
-Whether agents actually reach for the skill is measured separately; see
-[`tests/trigger-eval/README.md`](tests/trigger-eval/README.md).
+Runs against a fake `fm` on `PATH` and needs no model. One integration test
+runs a real step when the model answers and skips otherwise. The installer
+is tested against a throwaway `HOME`.
 
 ## Licence
 

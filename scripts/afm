@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
-"""afm: run a small text job on the on-device Apple Foundation Model via the fm CLI.
+"""afm: run agent-written, test-gated implementation steps on the on-device Apple Foundation Model.
 
-Exit codes: 0 ok, 1 fm failed, 2 usage, 3 bad JSON or label, 4 fm missing or
-model unavailable, 5 blocked by a sandbox, 6 input over budget.
+    afm run <steps-dir>     run every step in filename order, stop at the first failure
+    afm step <step-file>    run one step
+
+Exit codes: 0 all steps passed, 1 a step failed its tests or fm failed on it, 2 usage,
+4 fm missing or model unavailable, 5 blocked by a sandbox, 6 a step's prompt is over budget.
 """
 import argparse
 import json
@@ -12,21 +15,23 @@ import re
 import signal
 import subprocess
 import sys
-import tempfile
+import time
 
-EXIT_OK, EXIT_FM, EXIT_USAGE, EXIT_JSON, EXIT_UNAVAILABLE, EXIT_SANDBOX, EXIT_BUDGET = 0, 1, 2, 3, 4, 5, 6
+EXIT_OK, EXIT_FAIL, EXIT_USAGE, EXIT_UNAVAILABLE, EXIT_SANDBOX, EXIT_BUDGET = 0, 1, 2, 4, 5, 6
 
-HERE = os.path.dirname(os.path.realpath(__file__))
-PRESETS_DIR = os.path.join(os.path.dirname(HERE), "presets")
 DEFAULT_BUDGET = 7168
 DEFAULT_TIMEOUT = 120
-DEFAULT_MAX_CHUNKS = 8
-DEFAULT_GUARDRAILS = "permissive-content-transformations"
-DEFAULT_USE_CASE = "general"
-PRESET_NAMES = ("summarise", "classify", "extract", "commit-msg")
-USAGE = "usage: afm <preset> [options] < input | afm ask \"<instructions>\" [options] < input | afm --list"
+DEFAULT_RETRIES = 1
+TEST_TIMEOUT = 120
+USAGE = "usage: afm run <steps-dir> [--retries N] [--timeout S] [--budget T] [--json] | afm step <step-file> [options]"
 HANDLED_SIGNALS = (signal.SIGTERM, signal.SIGINT, signal.SIGHUP)
+HEADER_KEYS = ("file", "test", "context")
 _ANSI = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+_FENCE = re.compile(r"^\s*```[A-Za-z0-9_+-]*[ \t]*\n(.*?)\n```\s*$", re.S)
+
+INSTRUCTIONS = ("You are a code implementer. Reply with source code only: no explanation, no markdown fences, "
+                "no tests, no example usage. Use only the standard library unless the spec says otherwise. "
+                "The code will be saved as %s and imported.")
 
 
 class AfmError(Exception):
@@ -36,138 +41,68 @@ class AfmError(Exception):
         self.message = message
 
 
-class Job(object):
-    def __init__(self, name, instructions, labels=None, schema_path=None):
-        self.name = name
-        self.instructions = instructions
-        self.labels = labels
-        self.schema_path = schema_path
+class Step(object):
+    def __init__(self, step_id, path, file, test, context, spec):
+        self.id = step_id
+        self.path = path
+        self.file = file
+        self.test = test
+        self.context = context
+        self.spec = spec
 
 
-def list_presets():
-    out = []
-    for name in sorted(os.listdir(PRESETS_DIR)):
-        if name.endswith(".md"):
-            with open(os.path.join(PRESETS_DIR, name)) as f:
-                first = f.readline().strip()
-            out.append((name[:-3], first))
-    return out
+# --- step files ---------------------------------------------------------------
 
-
-class _Parser(argparse.ArgumentParser):
-    def error(self, message):
-        raise AfmError(EXIT_USAGE, "%s\n%s" % (message, USAGE))
-
-
-def parse_args(argv):
-    p = _Parser(prog="afm", add_help=True, usage=USAGE)
-    p.add_argument("job", nargs="?", help="preset name or 'ask'")
-    p.add_argument("instructions", nargs="?", help="instructions, with 'ask' only")
-    p.add_argument("--labels", help="classify only: comma-separated allowed labels")
-    p.add_argument("--schema", help="JSON schema file for structured output")
-    p.add_argument("--guardrails", default=DEFAULT_GUARDRAILS)
-    p.add_argument("--use-case", dest="use_case", default=DEFAULT_USE_CASE)
-    p.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT)
-    p.add_argument("--budget", type=int, default=DEFAULT_BUDGET)
-    p.add_argument("--chunk", action="store_true")
-    p.add_argument("--max-chunks", dest="max_chunks", type=int, default=DEFAULT_MAX_CHUNKS)
-    p.add_argument("--list", action="store_true")
-    args = p.parse_args(argv)
-    if not (args.timeout > 0) or math.isinf(args.timeout):
-        raise AfmError(EXIT_USAGE, "--timeout must be a positive number of seconds")
-    if args.budget < 1:
-        raise AfmError(EXIT_USAGE, "--budget must be at least 1")
-    if args.max_chunks < 1:
-        raise AfmError(EXIT_USAGE, "--max-chunks must be at least 1")
-    return args
-
-
-def parse_labels(text):
-    labels = [x.strip() for x in text.split(",")]
-    if any(not x for x in labels):
-        raise AfmError(EXIT_USAGE, "empty label in --labels (labels are comma-separated and cannot contain commas)")
-    if len(set(labels)) != len(labels):
-        raise AfmError(EXIT_USAGE, "duplicate label in --labels")
-    for label in labels:
-        if any(ch in label for ch in "\"'\\"):
-            raise AfmError(EXIT_USAGE, "label %r: quotes and backslashes are not allowed in labels" % label)
-    return labels
-
-
-def load_preset(name):
-    path = os.path.join(PRESETS_DIR, name + ".md")
-    with open(path) as f:
-        return f.read().strip()
-
-
-def check_schema_file(path):
-    if not os.path.isfile(path):
-        raise AfmError(EXIT_USAGE, "schema file not found: %s" % path)
+def parse_step(path):
+    step_id = os.path.splitext(os.path.basename(path))[0]
     try:
         with open(path, encoding="utf-8") as f:
-            obj = json.load(f)
-    except (OSError, ValueError, UnicodeDecodeError) as e:
-        raise AfmError(EXIT_USAGE, "schema file %s is not valid JSON (%s)" % (path, e))
-    if not isinstance(obj, dict) or "x-order" not in obj:
-        raise AfmError(EXIT_USAGE, "schema file %s must be an object with an x-order key; generate it with "
-                                   "fm schema object --name X --string a --integer b" % path)
+            text = f.read()
+    except OSError as e:
+        raise AfmError(EXIT_USAGE, "cannot read step %s (%s)" % (path, e))
+    if "\n---\n" not in text and not text.startswith("---\n"):
+        raise AfmError(EXIT_USAGE, "step %s: no '---' line separating the header from the spec" % step_id)
+    header, _, spec = text.partition("\n---\n") if not text.startswith("---\n") else ("", "", text[4:])
+    fields = {}
+    for line in header.splitlines():
+        if not line.strip():
+            continue
+        key, sep, value = line.partition(":")
+        key = key.strip()
+        if not sep or key not in HEADER_KEYS:
+            raise AfmError(EXIT_USAGE, "step %s: unknown header line %r (allowed: %s)" % (step_id, line, ", ".join(HEADER_KEYS)))
+        fields[key] = value.strip()
+    if not fields.get("file"):
+        raise AfmError(EXIT_USAGE, "step %s: missing 'file:' header (the one file this step writes)" % step_id)
+    if not fields.get("test"):
+        raise AfmError(EXIT_USAGE, "step %s: missing 'test:' header (the command that judges the step)" % step_id)
+    spec = spec.strip()
+    if not spec:
+        raise AfmError(EXIT_USAGE, "step %s: the spec after '---' is empty" % step_id)
+    context = [c.strip() for c in fields.get("context", "").split(",") if c.strip()]
+    for c in context:
+        if not os.path.isfile(c):
+            raise AfmError(EXIT_USAGE, "step %s: context file not found: %s" % (step_id, c))
+    return Step(step_id, path, fields["file"], fields["test"], context, spec)
 
 
-def resolve_job(args):
-    if not args.job:
-        raise AfmError(EXIT_USAGE, USAGE)
-    if args.job == "ask":
-        if not args.instructions:
-            raise AfmError(EXIT_USAGE, "ask needs instructions as its argument")
-        instructions = args.instructions
-    elif args.job in PRESET_NAMES:
-        if args.instructions:
-            raise AfmError(EXIT_USAGE, "unexpected argument %r (only ask takes instructions)" % args.instructions)
-        instructions = load_preset(args.job)
-    else:
-        raise AfmError(EXIT_USAGE, "unknown preset %r; run afm --list" % args.job)
-    labels = None
-    if args.job == "classify":
-        if not args.labels:
-            raise AfmError(EXIT_USAGE, "classify needs --labels a,b,c")
-        if args.schema:
-            raise AfmError(EXIT_USAGE, "--schema is not allowed with classify (its schema is generated)")
-        labels = parse_labels(args.labels)
-        instructions = instructions.replace("{labels}", ", ".join(labels))
-    elif args.labels:
-        raise AfmError(EXIT_USAGE, "--labels is only for classify")
-    if args.job == "extract" and not args.schema:
-        raise AfmError(EXIT_USAGE, "extract needs --schema FILE")
-    if args.job == "commit-msg" and args.chunk:
-        raise AfmError(EXIT_USAGE, "--chunk is not allowed with commit-msg; pipe a smaller diff")
-    if args.schema:
-        check_schema_file(args.schema)
-    return Job(args.job, instructions, labels, args.schema)
+def load_steps(directory):
+    if not os.path.isdir(directory):
+        raise AfmError(EXIT_USAGE, "steps directory not found: %s" % directory)
+    names = sorted(n for n in os.listdir(directory) if n.endswith(".md"))
+    if not names:
+        raise AfmError(EXIT_USAGE, "no step files (*.md) in %s" % directory)
+    return [parse_step(os.path.join(directory, n)) for n in names]
 
 
-def read_input():
-    if sys.stdin.isatty():
-        raise AfmError(EXIT_USAGE, "afm reads its input from stdin; pipe or redirect it")
-    text = sys.stdin.buffer.read().decode("utf-8", errors="replace")
-    text = text.replace("\r\n", "\n").replace("\r", "\n")
-    if not text.strip():
-        raise AfmError(EXIT_USAGE, "input is empty")
-    return text
-
-
-# --- running fm --------------------------------------------------------------
+# --- running fm ---------------------------------------------------------------
 
 _CHILD = None
-_TEMP_FILES = []
 _TIMEOUT = DEFAULT_TIMEOUT
 
 
-def _strip_ansi(text):
-    return _ANSI.sub("", text)
-
-
 def run_fm(args, stdin_text, timeout=None):
-    """Run fm with one failure policy: cannot run -> 4, sandbox 1008 -> 5, timeout -> 1."""
+    """Run fm with one failure policy: cannot run -> 4, sandbox 1008 -> 5, timeout -> AfmError(1)."""
     global _CHILD
     timeout = timeout or _TIMEOUT
     signal.pthread_sigmask(signal.SIG_BLOCK, HANDLED_SIGNALS)
@@ -185,10 +120,10 @@ def run_fm(args, stdin_text, timeout=None):
     except subprocess.TimeoutExpired:
         proc.kill()
         proc.communicate()
-        raise AfmError(EXIT_FM, "timed out after %g s" % timeout)
+        raise AfmError(EXIT_FAIL, "timed out after %g s" % timeout)
     finally:
         _CHILD = None
-    err = _strip_ansi(err)
+    err = _ANSI.sub("", err)
     if proc.returncode != 0 and "ModelManager" in err and "1008" in err:
         raise AfmError(EXIT_SANDBOX, "fm is blocked by a sandbox; run afm outside it")
     return proc.returncode, out, err
@@ -200,198 +135,139 @@ def count_tokens(text, instructions=""):
         args.append("--instructions=" + instructions)
     code, out, err = run_fm(args, text)
     if code != 0:
-        raise AfmError(EXIT_FM, err.strip() or "fm count-tokens failed with exit %d" % code)
+        raise AfmError(EXIT_FAIL, err.strip() or "fm count-tokens failed with exit %d" % code)
     try:
         return int(out.strip())
     except ValueError:
-        raise AfmError(EXIT_FM, "fm count-tokens returned %r" % out.strip())
+        raise AfmError(EXIT_FAIL, "fm count-tokens returned %r" % out.strip())
 
 
-def schema_tokens(path):
-    with open(path, encoding="utf-8") as f:
-        return count_tokens(f.read())
-
-
-def check_budget(total, budget, args, job):
-    if total <= budget or args.chunk:
-        return
-    if job.name == "commit-msg":
-        advice = "pipe a smaller diff, for example { git diff --cached --stat; git diff --cached -U1; }"
-    else:
-        advice = "rerun with --chunk"
-    raise AfmError(EXIT_BUDGET, "input is %d tokens, budget is %d; %s" % (total, budget, advice))
-
-
-def respond(job, text, args, schema_path):
-    cmd = ["respond", "--no-stream", "--greedy", "--instructions=" + job.instructions,
-           "--guardrails", args.guardrails, "--use-case", args.use_case]
-    if schema_path:
-        cmd += ["--schema", schema_path]
-    code, out, err = run_fm(cmd, text, timeout=args.timeout)
+def generate(instructions, prompt, timeout):
+    """One model call. Returns the code, or raises AfmError(EXIT_FAIL) with fm's message."""
+    code, out, err = run_fm(["respond", "--no-stream", "--greedy", "--instructions=" + instructions], prompt, timeout=timeout)
     if code != 0:
         acode, _, aerr = run_fm(["available"], "")
         if acode != 0:
             raise AfmError(EXIT_UNAVAILABLE, aerr.strip() or "model not available")
-        raise AfmError(EXIT_FM, err.strip() or "fm respond failed with exit %d" % code)
-    if not out.strip():
-        raise AfmError(EXIT_FM, "model returned no output")
-    return out
+        raise AfmError(EXIT_FAIL, err.strip() or "fm respond failed with exit %d" % code)
+    text = strip_fence(out)
+    if not text.strip():
+        raise AfmError(EXIT_FAIL, "model returned no output")
+    return text
 
 
-# --- schemas and answers ----------------------------------------------------
-
-def classify_schema(labels):
-    return {
-        "title": "Classification",
-        "type": "object",
-        "properties": {"label": {"type": "string", "enum": list(labels)}},
-        "required": ["label"],
-        "x-order": ["label"],
-        "additionalProperties": False,
-    }
+def strip_fence(text):
+    m = _FENCE.match(text)
+    if m:
+        text = m.group(1)
+    return text.rstrip() + "\n"
 
 
-def write_temp_schema(obj):
-    signal.pthread_sigmask(signal.SIG_BLOCK, HANDLED_SIGNALS)
+# --- prompts -------------------------------------------------------------------
+
+def read_file(path):
+    with open(path, encoding="utf-8", errors="replace") as f:
+        return f.read()
+
+
+def build_prompt(step, current, previous=None, test_output=None):
+    parts = [step.spec]
+    if current is not None:
+        parts.append("Current contents of %s. Output the complete modified file:\n\n%s" % (step.file, current))
+    for path in step.context:
+        parts.append("Reference only, do not modify: %s\n\n%s" % (path, read_file(path)))
+    if previous is not None:
+        parts.append("Your previous implementation:\n\n%s" % previous)
+        parts.append("It failed these tests. Output the complete corrected file:\n\n%s" % (test_output or "")[-1800:])
+    return "\n\n".join(p.rstrip() for p in parts) + "\n"
+
+
+# --- running a step -------------------------------------------------------------
+
+def run_tests(command):
     try:
-        fd, path = tempfile.mkstemp(prefix="afm-schema-", suffix=".json")
-        _TEMP_FILES.append(path)
-    finally:
-        signal.pthread_sigmask(signal.SIG_UNBLOCK, HANDLED_SIGNALS)
-    with os.fdopen(fd, "w") as f:
-        json.dump(obj, f)
-    return path
+        p = subprocess.run(command, shell=True, capture_output=True, text=True, timeout=TEST_TIMEOUT)
+        return p.returncode == 0, (p.stdout + p.stderr)
+    except subprocess.TimeoutExpired:
+        return False, "test command timed out after %d s" % TEST_TIMEOUT
 
 
-def parse_answer(raw, job, schema_path):
-    if not schema_path:
-        return raw.rstrip()
-    try:
-        obj = json.loads(raw)
-    except ValueError:
-        raise AfmError(EXIT_JSON, "model output is not valid JSON:\n%s" % raw.rstrip())
-    if job.labels is not None:
-        label = obj.get("label") if isinstance(obj, dict) else None
-        if label not in job.labels:
-            raise AfmError(EXIT_JSON, "label %r is not one of %s" % (label, ", ".join(job.labels)))
-    return json.dumps(obj, separators=(",", ":"), ensure_ascii=False)
+def write_file(path, content):
+    d = os.path.dirname(path)
+    if d:
+        os.makedirs(d, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(content)
 
 
-# --- chunking ---------------------------------------------------------------
-
-class Unit(object):
-    def __init__(self, text, sep, line):
-        self.text = text
-        self.sep = sep
-        self.line = line
-
-
-def split_units(text):
-    """Non-blank paragraphs separated by blank lines, each with its first line number."""
-    units = []
-    line = 1
-    pos = 0
-    for m in re.finditer(r"\n[ \t]*\n+", text):
-        _add_unit(units, text[pos:m.start()], "\n\n", line)
-        line += text[pos:m.end()].count("\n")
-        pos = m.end()
-    _add_unit(units, text[pos:], "\n\n", line)
-    return units
-
-
-def _add_unit(units, chunk, sep, line):
-    """Append chunk as a unit unless it is only whitespace; leading blank lines are skipped."""
-    if not chunk.strip():
-        return
-    stripped = chunk.lstrip("\n")
-    units.append(Unit(stripped.rstrip("\n"), "" if not units else sep, line + (len(chunk) - len(stripped))))
-
-
-def _explode_lines(unit):
-    out = []
-    for i, ln in enumerate(unit.text.split("\n")):
-        if not ln.strip():
-            continue
-        out.append(Unit(ln, unit.sep if not out else "\n", unit.line + i))
-    return out
-
-
-def _join(units):
-    return "".join((u.sep if i else "") + u.text for i, u in enumerate(units))
-
-
-def plan_chunks(text, job, overhead, budget, max_chunks, total_tokens):
-    """Pack units greedily by a byte ratio, confirm each piece with fm count-tokens.
-
-    overhead is the token cost of the schema (if any); the instructions are
-    counted once here and the ratio is built from the input alone.
-    """
-    instr_tokens = count_tokens(job.instructions)
-    fixed = overhead + instr_tokens
-    ratio = float(max(1, total_tokens - instr_tokens)) / max(1, len(text.encode()))
-    units = split_units(text)
-    pieces = []
-    i = 0
-    while i < len(units):
-        piece = []
-        nbytes = 0
-        while i < len(units):
-            b = len(units[i].text.encode()) + len(units[i].sep.encode())
-            if piece and (nbytes + b) * ratio + fixed > budget:
-                break
-            piece.append(units[i])
-            nbytes += b
-            i += 1
-        while True:
-            candidate = _join(piece)
-            if count_tokens(candidate, job.instructions) + overhead <= budget:
-                break
-            if len(piece) > 1:
-                piece.pop()
-                i -= 1
-                continue
-            u = piece[0]
-            if "\n" in u.text:
-                units[i - 1:i] = _explode_lines(u)
-                i -= 1
-                piece = []
-                break
-            n = count_tokens(u.text)
-            raise AfmError(EXIT_BUDGET, "line %d is %d tokens plus %d for instructions and schema, budget is %d"
-                           % (u.line, n, fixed, budget))
-        if not piece:
-            continue
-        pieces.append(candidate)
-        if len(pieces) > max_chunks:
-            raise AfmError(EXIT_BUDGET, "input needs more than %d chunks, max is %d" % (max_chunks, max_chunks))
-    return pieces
-
-
-def run_chunks(pieces, job, args, schema_path):
-    n = len(pieces)
-    outputs = []
-    for idx, piece in enumerate(pieces, 1):
+def run_step(step, args):
+    """Returns (result, attempts, seconds, failure) where failure is None or a dict."""
+    t0 = time.time()
+    existed = os.path.isfile(step.file)
+    original = read_file(step.file) if existed else None
+    instructions = INSTRUCTIONS % step.file
+    previous = output = None
+    attempts = 0
+    code = ""
+    while attempts <= args.retries:
+        attempts += 1
+        prompt = build_prompt(step, original, previous, output)
+        used = count_tokens(prompt, instructions)
+        if used > args.budget:
+            raise AfmError(EXIT_BUDGET, "step %s: prompt is %d tokens, budget is %d; split the step or trim its context"
+                           % (step.id, used, args.budget))
         try:
-            answer = parse_answer(respond(job, piece, args, schema_path), job, schema_path)
+            code = generate(instructions, prompt, args.timeout)
         except AfmError as e:
-            raise AfmError(e.code, "chunk %d/%d: %s" % (idx, n, e.message))
-        if schema_path:
-            outputs.append(answer + "\n")
-        else:
-            outputs.append("[%d/%d]\n%s\n" % (idx, n, answer))
-    return "".join(outputs)
-
-
-# --- lifecycle --------------------------------------------------------------
-
-def cleanup():
-    while _TEMP_FILES:
-        path = _TEMP_FILES.pop()
+            if e.code != EXIT_FAIL:
+                raise
+            output = "fm: " + e.message
+            previous = code or "(no code produced)"
+            continue
+        write_file(step.file, code)
+        ok, output = run_tests(step.test)
+        if ok:
+            return "pass", attempts, time.time() - t0, None
+        previous = code
+    # final failure: restore or remove, keep the attempt beside the file
+    saved = step.file + ".afm-failed"
+    write_file(saved, code if code else "(no code produced)\n")
+    if existed:
+        write_file(step.file, original)
+        restored = "%s restored" % step.file
+    else:
         try:
-            os.unlink(path)
+            os.unlink(step.file)
         except OSError:
             pass
+        restored = "%s removed" % step.file
+    return "FAIL", attempts, time.time() - t0, {"id": step.id, "test": step.test, "output": output or "",
+                                                  "saved": saved, "restored": restored}
 
+
+# --- reports --------------------------------------------------------------------
+
+def report_text(rows, failed):
+    w_id = max(len("step"), max(len(r["id"]) for r in rows))
+    w_file = max(len("file"), max(len(r["file"]) for r in rows))
+    lines = ["%-*s  %-*s  %-7s  %s" % (w_id, "step", w_file, "file", "result", "attempts")]
+    for r in rows:
+        lines.append("%-*s  %-*s  %-7s  %s" % (w_id, r["id"], w_file, r["file"], r["result"], r["attempts"] if r["attempts"] else "-"))
+    if failed:
+        tail = "\n".join(failed["output"].strip().splitlines()[-60:])
+        lines += ["", "step %s failed after %d attempt%s" % (failed["id"], failed["attempts"], "" if failed["attempts"] == 1 else "s"),
+                  "test: %s" % failed["test"], tail, "attempt saved at %s; %s" % (failed["saved"], failed["restored"])]
+    return "\n".join(lines) + "\n"
+
+
+def report_json(rows, failed):
+    out = {"steps": rows, "failed": None}
+    if failed:
+        out["failed"] = {k: failed[k] for k in ("id", "test", "output", "saved")}
+    return json.dumps(out, indent=1) + "\n"
+
+
+# --- lifecycle ------------------------------------------------------------------
 
 def _on_signal(signum, frame):
     child = _CHILD
@@ -400,10 +276,9 @@ def _on_signal(signum, frame):
             child.kill()
         except OSError:
             pass
-    cleanup()
     sys.stderr.write("afm: interrupted by signal %d\n" % signum)
     sys.stderr.flush()
-    os._exit(EXIT_FM)
+    os._exit(EXIT_FAIL)
 
 
 def install_signal_handlers():
@@ -411,8 +286,29 @@ def install_signal_handlers():
         signal.signal(sig, _on_signal)
 
 
-def emit_text(answer):
-    sys.stdout.write(answer.rstrip() + "\n")
+class _Parser(argparse.ArgumentParser):
+    def error(self, message):
+        raise AfmError(EXIT_USAGE, "%s\n%s" % (message, USAGE))
+
+
+def parse_args(argv):
+    p = _Parser(prog="afm", usage=USAGE)
+    p.add_argument("command", nargs="?", choices=["run", "step"])
+    p.add_argument("target", nargs="?")
+    p.add_argument("--retries", type=int, default=DEFAULT_RETRIES)
+    p.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT)
+    p.add_argument("--budget", type=int, default=DEFAULT_BUDGET)
+    p.add_argument("--json", action="store_true")
+    args = p.parse_args(argv)
+    if not args.command or not args.target:
+        raise AfmError(EXIT_USAGE, USAGE)
+    if args.retries < 0:
+        raise AfmError(EXIT_USAGE, "--retries must be 0 or more")
+    if not (args.timeout > 0) or math.isinf(args.timeout):
+        raise AfmError(EXIT_USAGE, "--timeout must be a positive number of seconds")
+    if args.budget < 1:
+        raise AfmError(EXIT_USAGE, "--budget must be at least 1")
+    return args
 
 
 def main(argv):
@@ -420,31 +316,29 @@ def main(argv):
     install_signal_handlers()
     try:
         args = parse_args(argv)
-        if args.list:
-            for name, first in list_presets():
-                print("%-12s %s" % (name, first))
-            return EXIT_OK
         _TIMEOUT = args.timeout
-        job = resolve_job(args)
-        text = read_input()
-        schema_path = job.schema_path
-        if job.labels is not None:
-            schema_path = write_temp_schema(classify_schema(job.labels))
-        overhead = schema_tokens(schema_path) if schema_path else 0
-        total = count_tokens(text, job.instructions) + overhead
-        check_budget(total, args.budget, args, job)
-        if args.chunk:
-            pieces = plan_chunks(text, job, overhead, args.budget, args.max_chunks, total - overhead)
-            sys.stdout.write(run_chunks(pieces, job, args, schema_path))
+        if args.command == "run":
+            steps = load_steps(args.target)
         else:
-            answer = respond(job, text, args, schema_path)
-            emit_text(parse_answer(answer, job, schema_path))
-        return EXIT_OK
+            if not os.path.isfile(args.target):
+                raise AfmError(EXIT_USAGE, "step file not found: %s" % args.target)
+            steps = [parse_step(args.target)]
+        rows = []
+        failed = None
+        for step in steps:
+            if failed:
+                rows.append({"id": step.id, "file": step.file, "result": "skipped", "attempts": 0, "seconds": 0})
+                continue
+            result, attempts, seconds, failure = run_step(step, args)
+            rows.append({"id": step.id, "file": step.file, "result": result, "attempts": attempts, "seconds": round(seconds, 1)})
+            if failure:
+                failure["attempts"] = attempts
+                failed = failure
+        sys.stdout.write(report_json(rows, failed) if args.json else report_text(rows, failed))
+        return EXIT_FAIL if failed else EXIT_OK
     except AfmError as e:
         sys.stderr.write("afm: %s\n" % e.message)
         return e.code
-    finally:
-        cleanup()
 
 
 if __name__ == "__main__":

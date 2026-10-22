@@ -47,10 +47,10 @@ class InstallTests(unittest.TestCase):
             self.assertEqual(json.load(f)["permission"]["shell"]["afm *"], "allow")
         for rules in (".claude/CLAUDE.md", ".codex/AGENTS.md", ".config/opencode/AGENTS.md"):
             with open(os.path.join(self.home, rules)) as f:
-                self.assertIn("pipe it into `afm`", f.read())
+                self.assertIn("run them with `afm run`", f.read())
         with open(os.path.join(self.home, ".zprofile")) as f:
             self.assertIn(".local/bin", f.read())
-        self.assertIn("classify", p.stdout)
+        self.assertIn("afm run", p.stdout)
 
     def test_second_run_is_idempotent(self):
         run_install(self.home)
@@ -59,7 +59,7 @@ class InstallTests(unittest.TestCase):
         with open(os.path.join(self.home, ".claude", "settings.json")) as f:
             self.assertEqual(json.load(f)["sandbox"]["excludedCommands"].count("afm *"), 1)
         with open(os.path.join(self.home, ".claude", "CLAUDE.md")) as f:
-            self.assertEqual(f.read().count("pipe it into `afm`"), 1)
+            self.assertEqual(f.read().count("run them with `afm run`"), 1)
         with open(os.path.join(self.home, ".zprofile")) as f:
             self.assertEqual(f.read().count(".local/bin"), 1)
 

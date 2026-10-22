@@ -30,9 +30,10 @@ hidden tests and one retry (same specs given to Haiku and Sonnet):
 The model passed every step whose logic was a direct transcription of the
 spec, including a modify-an-existing-module step. It failed on padding and
 format rules, an off-by-one field count and digit-width validation, and did
-not repair those from the failing test output. So: specs must be tight,
-tests are the gate, and the agent should expect to take over roughly one step
-in three.
+not repair those from the failing test output. A rerun of the same specs
+through `afm run` passed 3 of 7: greedy decoding makes individual steps
+sensitive to prompt wording. So: specs must be tight, tests are the gate, and
+the agent should expect about half the steps to come back to it.
 
 This is not a cost tool against Haiku, which did the same work for a cent.
 It is for work that must stay on the machine, and for the discipline of
@@ -166,7 +167,7 @@ agent has a task it could hand off:
 > machine. You break the task into one-function or one-edit steps, each with
 > a tight spec and a test command; `afm run` executes them, tests each, and
 > reports once. Use for mechanical implementation work where tests can judge
-> the result; expect to take over about one step in three. macOS only.
+> the result; expect about half the steps to come back to you. macOS only.
 
 Body: how to break work down (one function or one edit per step; spec =
 signature, behaviour, examples, edge cases, interfaces it depends on; tests
