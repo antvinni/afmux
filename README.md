@@ -1,6 +1,15 @@
 # afmux
 
-afmux turns Apple's free on-device Foundation Model into an implementer for coding agents (Claude Code, Codex, OpenCode). The agent breaks a task into small test-gated steps and writes each step's spec and tests; `afm run` implements each step locally, runs its tests, retries once, and reports back once.
+afmux turns Apple's free on-device Foundation Model into an implementer for coding agents (Claude Code, Codex, OpenCode). 
+
+The agent breaks a task into small test-gated steps and writes each step's spec and tests; `afm run` implements each step locally, runs its tests, retries once, and reports back once.
+
+### Installation
+
+```
+curl -fsSL https://raw.githubusercontent.com/antvinni/afmux/main/install.sh | bash
+```
+
 
 ### Features
 
@@ -12,12 +21,6 @@ afmux turns Apple's free on-device Foundation Model into an implementer for codi
 | **Local only** | Runs on the macOS 27 `fm` CLI. No network, no API key, no cost. |
 | **Sandbox aware** | Detects the sandbox block (`ModelManagerError 1008`) and exits 5 instead of failing silently. `afm run` takes arguments only, so one `excludedCommands` entry covers it. |
 | **No dependencies** | One Python 3 stdlib script; macOS 27 on Apple silicon with the Command Line Tools. |
-
-### Installation
-
-```
-curl -fsSL https://raw.githubusercontent.com/antvinni/afmux/main/install.sh | bash
-```
 
 ### Usage
 
