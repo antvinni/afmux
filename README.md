@@ -21,12 +21,28 @@ There is no daemon, server or queue. The design and its measurements are in
 
 ## Install
 
+One line:
+
 ```bash
-git clone https://github.com/antvinni/afmux ~/src/afmux
-mkdir -p ~/.local/bin && ln -sf ~/src/afmux/scripts/afm ~/.local/bin/afm   # ~/.local/bin must be on PATH
+curl -fsSL https://raw.githubusercontent.com/antvinni/afmux/main/install.sh | bash
+```
+
+It checks the requirements, clones afmux into `~/.afmux` (or updates it),
+puts `afm` on your `PATH` via `~/.local/bin`, links the skill into
+`~/.claude/skills` and `~/.agents/skills`, and, for each agent it finds
+installed, adds the standing rule below and the sandbox or permission
+setting from the sections below. It is safe to run again. Set `AFMUX_DIR` to
+choose the checkout location, or run `./install.sh` from a clone to use that
+clone in place. Nothing it does is hidden: read it first if you prefer.
+
+By hand, the same thing is:
+
+```bash
+git clone https://github.com/antvinni/afmux ~/.afmux
+mkdir -p ~/.local/bin && ln -sf ~/.afmux/scripts/afm ~/.local/bin/afm   # ~/.local/bin must be on PATH
 mkdir -p ~/.claude/skills ~/.agents/skills
-ln -sfn ~/src/afmux ~/.claude/skills/afmux    # Claude Code (OpenCode reads this too)
-ln -sfn ~/src/afmux ~/.agents/skills/afmux    # Codex (OpenCode reads this too)
+ln -sfn ~/.afmux ~/.claude/skills/afmux    # Claude Code (OpenCode reads this too)
+ln -sfn ~/.afmux ~/.agents/skills/afmux    # Codex (OpenCode reads this too)
 afm --list
 ```
 
@@ -44,8 +60,10 @@ the skill directory is.
 ## Tell the agent when to use it
 
 Skill descriptions alone trigger weakly for a tool whose point is saving
-tokens. Add this standing rule to your `CLAUDE.md` (Claude Code) or
-`AGENTS.md` (Codex, OpenCode):
+tokens. The installer adds this standing rule to `~/.claude/CLAUDE.md`,
+`~/.codex/AGENTS.md` and `~/.config/opencode/AGENTS.md` for the agents it
+finds; to add it by hand, or per project, put it in your `CLAUDE.md` (Claude
+Code) or `AGENTS.md` (Codex, OpenCode):
 
 ```
 When you need only a summary, a label, some fields or a commit message from command output or a file, pipe it into `afm` (see the afmux skill) instead of reading it yourself.
@@ -61,7 +79,8 @@ Inside a sandboxed shell, `fm available` succeeds but `fm respond` and
 1008`. `afm` reports that as exit 5 and tells the agent to run it outside the
 sandbox.
 
-**Claude Code.** Add `afm` to the sandbox exclusions in `~/.claude/settings.json`:
+**Claude Code.** The installer adds `afm` to the sandbox exclusions in
+`~/.claude/settings.json`; by hand:
 
 ```json
 {
@@ -87,7 +106,8 @@ sessions that use `afm`. See [Agent approvals and
 security](https://learn.chatgpt.com/docs/agent-approvals-security).
 
 **OpenCode.** OpenCode gates commands with permission rules rather than an
-OS sandbox. To skip the prompt, allow the pattern in `opencode.json`:
+OS sandbox. The installer allows the pattern in
+`~/.config/opencode/opencode.json`; by hand:
 
 ```json
 {
@@ -134,7 +154,9 @@ the agent should do on each code. In short: 0 answer, 1 model failed, 2 usage,
 python3 -m unittest discover tests
 ```
 
-The suite runs against a fake `fm` on `PATH` and needs no model. One
+The suite runs against a fake `fm` on `PATH` and needs no model. It covers
+the script, the hook and the installer (which it runs against a throwaway
+`HOME`). One
 integration test runs only when the real model answers, and skips otherwise.
 
 Whether agents actually reach for the skill is measured separately; see

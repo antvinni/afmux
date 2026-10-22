@@ -396,6 +396,10 @@ This is not part of `unittest`: it needs the paid agents and costs tokens.
 
 ## Installation
 
+`install.sh` does the steps below in one run and is idempotent; the README's
+one-liner fetches it from the main branch. It only configures agents whose
+config directory already exists.
+
 Requirements: macOS 27 or later on Apple silicon with the on-device model
 enabled, and the Xcode Command Line Tools (for `/usr/bin/python3` and `git`).
 
