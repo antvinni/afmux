@@ -108,6 +108,33 @@ class InstallTests(unittest.TestCase):
         self.assertEqual(os.path.realpath(afm), os.path.realpath(os.path.join(ROOT, "scripts", "afm")))
         self.assertFalse(os.path.exists(os.path.join(self.home, ".afmux")))
 
+    def test_malformed_settings_json_aborts_and_is_untouched(self):
+        os.makedirs(os.path.join(self.home, ".claude"))
+        path = os.path.join(self.home, ".claude", "settings.json")
+        with open(path, "w") as f:
+            f.write('{"model": "opus", // comment\n}')
+        before = open(path).read()
+        p = run_install(self.home, agents=("claude",))
+        self.assertNotEqual(p.returncode, 0)
+        self.assertIn("not valid JSON", p.stderr)
+        self.assertEqual(open(path).read(), before)
+        self.assertFalse(os.path.exists(path + ".afmux-backup"))
+
+    def test_rewritten_settings_json_keeps_a_backup(self):
+        os.makedirs(os.path.join(self.home, ".claude"))
+        path = os.path.join(self.home, ".claude", "settings.json")
+        original = {"model": "opus", "permissions": {"allow": ["Bash(git status *)"]}}
+        with open(path, "w") as f:
+            json.dump(original, f)
+        p = run_install(self.home, agents=("claude",))
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        with open(path + ".afmux-backup") as f:
+            self.assertEqual(json.load(f), original)
+        with open(path) as f:
+            cfg = json.load(f)
+        self.assertEqual(cfg["permissions"], original["permissions"])
+        self.assertEqual(cfg["sandbox"]["excludedCommands"], ["afm *"])
+
     def test_model_unavailable_fails_clearly(self):
         p = run_install(self.home, extra_env={"FAKEFM_AVAILABLE_EXIT": "1"})
         self.assertNotEqual(p.returncode, 0)
