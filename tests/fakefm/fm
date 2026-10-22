@@ -87,7 +87,16 @@ def main():
         if code:
             sys.stderr.write(env("FAKEFM_RESPOND_STDERR", ""))
             sys.exit(code)
-        if env("FAKEFM_RESPOND_MODE") == "first-line":
+        seq = env("FAKEFM_RESPOND_SEQ")
+        if seq:
+            path = os.path.join(seq, str(n))
+            if os.path.exists(path):
+                with open(path) as f:
+                    sys.stdout.write(f.read())
+            else:
+                sys.stderr.write("fakefm: no reply %d in %s\n" % (n, seq))
+                sys.exit(1)
+        elif env("FAKEFM_RESPOND_MODE") == "first-line":
             print(stdin.split("\n", 1)[0])
         else:
             print(env("FAKEFM_RESPOND_STDOUT", "OK"))
