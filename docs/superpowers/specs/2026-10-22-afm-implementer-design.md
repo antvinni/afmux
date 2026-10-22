@@ -1,6 +1,6 @@
-# afm implementer design
+# afm design: implementer and reader
 
-Date: 2026-10-22. Status: agreed.
+Date: 2026-10-22. Status: agreed; read mode added the same day.
 
 ## Purpose
 
@@ -233,8 +233,50 @@ signals; one integration test on the real model, skipped when unavailable.
 `tests/test_install.py` unchanged except the installer no longer mentions the
 hook.
 
+## Read mode (borrowed from MinionS)
+
+`afm read <file> --ask "question" [--chunk-tokens N] [--json]`
+
+The MinionS protocol (HazyResearch, arXiv 2502.15964) has the cloud model
+decompose a question over a long document into many small jobs for a local
+model and never read the document itself; they report 5.7x lower cloud cost
+at 97.9 percent of cloud-only accuracy with an 8B local model, 93.4 percent
+with 3B. afmux borrows the shape with a fixed decomposition inside `afm`, so
+the agent spends one line rather than cloud tokens writing job code:
+
+1. Count the file's tokens once and split it at paragraph boundaries into
+   chunks of about `--chunk-tokens` (default 600; measured: 1500-token chunks
+   missed the decisive sentence for one of three questions, 600-token chunks
+   found it, matching the paper's finding that chunk size is the strongest
+   lever).
+2. For each chunk, one greedy call with a `found`/`quote` schema: set
+   `found` and copy a passage of one to three sentences exactly, or abstain.
+   There is no free-text answer field: measured, the model's answers
+   overreached beyond their quotes, and the quote is the only part that can
+   be verified.
+3. Drop abstentions and any quote not present in its chunk (whitespace and
+   case normalised). Print survivors as `[lines a-b] "quote"` with a header
+   line giving matched and dropped counts and the tokens read locally.
+4. One question per call; the agent synthesises and cites line ranges.
+
+What the model cannot borrow: MinionS gains up to 7 points from sampling each
+job many times; `fm` is nearly deterministic and has no temperature flag.
+
+Measured 2026-10-22 on a 1,060-line, 23.5k-token documentation page with
+five questions, Opus headless, five runs per arm (two at 1500-token chunks,
+three at 600): without afmux the agent ran `cat -n` (truncated by Claude Code
+at 30k characters) and grepped, mean $0.198 (0.177 to 0.256); with
+`afm read`, mean $0.205 (0.161 to 0.219), and in every run it grepped
+afterwards for exact line numbers. All five answers correct in all ten runs.
+Wall time 7 to 17x longer with afm (five questions at 50 to 100 s each).
+So read mode is a wash on tokens against an agent that already greps, and
+costs minutes; its value is that the file's text never enters the agent's
+context, not cost. Precision is low (a third to two thirds of chunks "match"
+a question only two chunks answer); recall is the thing to protect, which is
+why the default chunk is 600 tokens.
+
 ## Non-goals
 
-No pipe mode, presets, chunking, schemas, hooks or trigger evaluation. No
+No pipe-mode presets (summarise, classify, extract), hooks or trigger evaluation. No
 multi-file steps. No parallel steps: the device serialises anyway. No
 self-planning: breaking work into steps is the agent's job.

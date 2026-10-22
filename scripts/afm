@@ -15,6 +15,7 @@ import re
 import signal
 import subprocess
 import sys
+import tempfile
 import time
 
 EXIT_OK, EXIT_FAIL, EXIT_USAGE, EXIT_UNAVAILABLE, EXIT_SANDBOX, EXIT_BUDGET = 0, 1, 2, 4, 5, 6
@@ -22,8 +23,9 @@ EXIT_OK, EXIT_FAIL, EXIT_USAGE, EXIT_UNAVAILABLE, EXIT_SANDBOX, EXIT_BUDGET = 0,
 DEFAULT_BUDGET = 7168
 DEFAULT_TIMEOUT = 120
 DEFAULT_RETRIES = 1
+DEFAULT_CHUNK_TOKENS = 600
 TEST_TIMEOUT = 120
-USAGE = "afm run <steps-dir> [--retries N] [--timeout S] [--budget T] [--json] | afm step <step-file> [options]"
+USAGE = "afm run <steps-dir> [--retries N] [--timeout S] [--budget T] [--json] | afm step <step-file> [options] | afm read <file> --ask \"question\" [--chunk-tokens N] [--json]"
 HANDLED_SIGNALS = (signal.SIGTERM, signal.SIGINT, signal.SIGHUP)
 HEADER_KEYS = ("file", "test", "context")
 _ANSI = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
@@ -407,6 +409,151 @@ def report_json(rows, failed):
     return json.dumps(out, indent=1) + "\n"
 
 
+_TEMP_FILES = []
+
+
+def write_temp_schema(obj):
+    signal.pthread_sigmask(signal.SIG_BLOCK, HANDLED_SIGNALS)
+    try:
+        fd, path = tempfile.mkstemp(prefix="afm-schema-", suffix=".json")
+        _TEMP_FILES.append(path)
+    finally:
+        signal.pthread_sigmask(signal.SIG_UNBLOCK, HANDLED_SIGNALS)
+    with os.fdopen(fd, "w") as f:
+        json.dump(obj, f)
+    return path
+
+
+def cleanup_temp():
+    while _TEMP_FILES:
+        try:
+            os.unlink(_TEMP_FILES.pop())
+        except OSError:
+            pass
+
+
+class Unit(object):
+    def __init__(self, text, sep, line):
+        self.text = text
+        self.sep = sep
+        self.line = line
+
+
+def split_units(text):
+    """Non-blank paragraphs separated by blank lines, each with its first line number."""
+    units = []
+    line = 1
+    pos = 0
+    for m in re.finditer(r"\n[ \t]*\n+", text):
+        _add_unit(units, text[pos:m.start()], line)
+        line += text[pos:m.end()].count("\n")
+        pos = m.end()
+    _add_unit(units, text[pos:], line)
+    return units
+
+
+def _add_unit(units, chunk, line):
+    if not chunk.strip():
+        return
+    stripped = chunk.lstrip("\n")
+    units.append(Unit(stripped.rstrip("\n"), "" if not units else "\n\n", line + (len(chunk) - len(stripped))))
+
+
+def _join(units):
+    return "".join((u.sep if i else "") + u.text for i, u in enumerate(units))
+
+
+# --- read mode: answer a question about a file, one small chunk at a time ---------------
+
+READ_INSTRUCTIONS = ("You are given one chunk of a longer document and a question. If this chunk contains a passage that "
+                     "answers the question, set found to true and copy that passage into quote exactly as written, one to "
+                     "three sentences. If the chunk does not answer the question, set found to false and leave quote empty. "
+                     "Never write anything that is not in the chunk. Question: %s")
+
+READ_SCHEMA = {
+    "title": "Extract",
+    "type": "object",
+    "properties": {"found": {"type": "boolean"}, "quote": {"type": "string"}},
+    "required": ["found", "quote"],
+    "x-order": ["found", "quote"],
+    "additionalProperties": False,
+}
+
+
+def chunk_document(text, chunk_tokens, total_tokens):
+    """Pack paragraphs into chunks of about chunk_tokens, by the file's measured tokens-per-byte ratio.
+
+    Returns a list of (text, first_line, last_line)."""
+    ratio = float(max(1, total_tokens)) / max(1, len(text.encode()))
+    units = split_units(text)
+    chunks = []
+    cur, cur_bytes, first = [], 0, None
+    for u in units:
+        b = len(u.text.encode()) + 2
+        if cur and (cur_bytes + b) * ratio > chunk_tokens:
+            chunks.append((_join(cur), first, cur[-1].line + cur[-1].text.count("\n")))
+            cur, cur_bytes, first = [], 0, None
+        if first is None:
+            first = u.line
+        cur.append(u)
+        cur_bytes += b
+    if cur:
+        chunks.append((_join(cur), first, cur[-1].line + cur[-1].text.count("\n")))
+    return chunks
+
+
+def _norm(text):
+    return re.sub(r"\s+", " ", text).strip().lower()
+
+
+def read_file_answers(path, question, args):
+    text = read_file(path).replace("\r\n", "\n")
+    if not text.strip():
+        raise AfmError(EXIT_USAGE, "%s is empty" % path)
+    total = count_tokens(text)
+    chunks = chunk_document(text, args.chunk_tokens, total)
+    schema_path = write_temp_schema(READ_SCHEMA)
+    instructions = READ_INSTRUCTIONS % question.strip()
+    answers, dropped = [], 0
+    for ctext, first, last in chunks:
+        prompt = "Chunk lines %d-%d of %s\n---\n%s" % (first, last, os.path.basename(path), ctext)
+        code, out, err = run_fm(["respond", "--no-stream", "--greedy", "--instructions=" + instructions, "--schema", schema_path],
+                                prompt, timeout=args.timeout)
+        if code != 0:
+            acode, _, aerr = run_fm(["available"], "")
+            if acode != 0:
+                raise AfmError(EXIT_UNAVAILABLE, aerr.strip() or "model not available")
+            raise AfmError(EXIT_FAIL, "chunk lines %d-%d: %s" % (first, last, err.strip() or "fm respond failed"))
+        try:
+            obj = json.loads(out)
+        except ValueError:
+            dropped += 1
+            continue
+        if not isinstance(obj, dict) or not obj.get("found"):
+            continue
+        quote = str(obj.get("quote") or "")
+        if not quote.strip() or _norm(quote) not in _norm(ctext):
+            dropped += 1
+            continue
+        answers.append({"lines": "%d-%d" % (first, last), "quote": quote.strip()})
+    return {"file": path, "question": question, "chunks": len(chunks), "tokens": total, "dropped": dropped, "answers": answers}
+
+
+def report_read(res, as_json):
+    if as_json:
+        return json.dumps(res, indent=1, ensure_ascii=False) + "\n"
+    lines = []
+    if res["answers"]:
+        lines.append("%d of %d chunks matched (%d tokens read locally%s)" % (
+            len(res["answers"]), res["chunks"], res["tokens"], ", %d dropped: quote not in text" % res["dropped"] if res["dropped"] else ""))
+        for a in res["answers"]:
+            lines.append("[lines %s] \"%s\"" % (a["lines"], a["quote"]))
+    else:
+        lines.append("no chunk matched the question (%d chunks, %d tokens read locally%s)" % (
+            res["chunks"], res["tokens"], ", %d dropped: quote not in text" % res["dropped"] if res["dropped"] else ""))
+    return "\n".join(lines) + "\n"
+
+
 # --- lifecycle ------------------------------------------------------------------
 
 def _on_signal(signum, frame):
@@ -416,6 +563,7 @@ def _on_signal(signum, frame):
             child.kill()
         except OSError:
             pass
+    cleanup_temp()
     sys.stderr.write("afm: interrupted by signal %d\n" % signum)
     sys.stderr.flush()
     os._exit(EXIT_FAIL)
@@ -448,8 +596,12 @@ at <file>.afm-failed.log. Exit codes: 0 all passed, 1 a step failed, 2 usage, 4 
 def parse_args(argv):
     p = _Parser(prog="afm", usage=USAGE, epilog=HELP_EPILOG, formatter_class=argparse.RawDescriptionHelpFormatter,
                 description="Implement agent-written, test-gated steps on the on-device Apple Foundation Model.")
-    p.add_argument("command", nargs="?", choices=["run", "step"], help="run: every step in a directory in filename order; step: one step file")
-    p.add_argument("target", nargs="?", help="the steps directory (run) or the step file (step)")
+    p.add_argument("command", nargs="?", choices=["run", "step", "read"],
+                   help="run: every step in a directory in filename order; step: one step file; read: answer a question about a file chunk by chunk")
+    p.add_argument("target", nargs="?", help="the steps directory (run), the step file (step), or the document (read)")
+    p.add_argument("--ask", help="read: the question to answer from the file")
+    p.add_argument("--chunk-tokens", dest="chunk_tokens", type=int, default=DEFAULT_CHUNK_TOKENS,
+                   help="read: target size of each chunk the model sees (default %(default)s)")
     p.add_argument("--retries", type=int, default=DEFAULT_RETRIES, help="retries per step, each shown the failing test output (default %(default)s)")
     p.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT, help="seconds per model call (default %(default)s)")
     p.add_argument("--budget", type=int, default=DEFAULT_BUDGET, help="maximum prompt tokens per call (default %(default)s)")
@@ -463,6 +615,11 @@ def parse_args(argv):
         raise AfmError(EXIT_USAGE, "--timeout must be a positive number of seconds")
     if args.budget < 1:
         raise AfmError(EXIT_USAGE, "--budget must be at least 1")
+    if args.command == "read":
+        if not args.ask or not args.ask.strip():
+            raise AfmError(EXIT_USAGE, "read needs --ask \"question\"")
+        if args.chunk_tokens < 50:
+            raise AfmError(EXIT_USAGE, "--chunk-tokens must be at least 50")
     return args
 
 
@@ -472,6 +629,12 @@ def main(argv):
     try:
         args = parse_args(argv)
         _TIMEOUT = args.timeout
+        if args.command == "read":
+            if not os.path.isfile(args.target):
+                raise AfmError(EXIT_USAGE, "file not found: %s" % args.target)
+            res = read_file_answers(args.target, args.ask, args)
+            sys.stdout.write(report_read(res, args.json))
+            return EXIT_OK
         if args.command == "run":
             steps = load_steps(args.target)
         else:
@@ -498,6 +661,8 @@ def main(argv):
     except AfmError as e:
         sys.stderr.write("afm: %s\n" % e.message)
         return e.code
+    finally:
+        cleanup_temp()
 
 
 if __name__ == "__main__":
