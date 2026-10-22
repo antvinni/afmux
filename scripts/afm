@@ -25,7 +25,7 @@ DEFAULT_TIMEOUT = 120
 DEFAULT_RETRIES = 1
 DEFAULT_CHUNK_TOKENS = 600
 TEST_TIMEOUT = 120
-USAGE = "afm run <steps-dir> [--retries N] [--samples N] [--timeout S] [--budget T] [--json] | afm step <step-file> [options] | afm read <file> --ask \"question\" [--chunk-tokens N] [--json]"
+USAGE = "afm run <steps-dir> [--retries N] [--timeout S] [--budget T] [--json] | afm step <step-file> [options] | afm read <file> --ask \"question\" [--chunk-tokens N] [--json]"
 HANDLED_SIGNALS = (signal.SIGTERM, signal.SIGINT, signal.SIGHUP)
 HEADER_KEYS = ("file", "test", "context")
 _ANSI = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
@@ -300,22 +300,15 @@ def run_step(step, args, earlier=()):
     previous = output = None
     attempts = 0
     code = ""
-    tried = set()
-    # the greedy first attempt, then --samples - 1 samples of the same first prompt (MinionS: several
-    # samples per job, the tests pick), then the retries, each shown the failing test output
-    plan = ["first"] + ["sample"] * (args.samples - 1) + ["retry"] * args.retries
-    for kind in plan:
+    while attempts <= args.retries:
         attempts += 1
-        if kind == "retry":
-            prompt = build_prompt(step, original, previous, output)
-        else:
-            prompt = build_prompt(step, original)
+        prompt = build_prompt(step, original, previous, output)
         used = count_tokens(prompt, instructions)
         if used > args.budget:
             raise AfmError(EXIT_BUDGET, "step %s: prompt is %d tokens, budget is %d; split the step or trim its context"
                            % (step.id, used, args.budget))
         try:
-            new_code = generate(instructions, prompt, args.timeout, greedy=(kind == "first"))
+            new_code = generate(instructions, prompt, args.timeout, greedy=(attempts == 1))
         except AfmError as e:
             if e.code != EXIT_FAIL:
                 raise
@@ -323,12 +316,9 @@ def run_step(step, args, earlier=()):
             previous = code or "(no code produced)"
             notes.append("attempt %d failed: %s" % (attempts, e.message[:160]))
             continue
-        if new_code in tried or (previous is not None and new_code == previous):
+        if previous is not None and new_code == previous:
             notes.append("attempt %d produced identical code; not retested" % attempts)
-            if kind == "retry":
-                break
-            continue
-        tried.add(new_code)
+            break
         code = new_code
         write_file(step.file, code)
         ok, output = run_tests(step.test)
@@ -665,8 +655,6 @@ def parse_args(argv):
     p.add_argument("--chunk-tokens", dest="chunk_tokens", type=int, default=DEFAULT_CHUNK_TOKENS,
                    help="read: target size of each chunk the model sees (default %(default)s)")
     p.add_argument("--retries", type=int, default=DEFAULT_RETRIES, help="retries per step, each shown the failing test output (default %(default)s)")
-    p.add_argument("--samples", type=int, default=1,
-                   help="run/step: after a failing greedy attempt, test up to N-1 sampled attempts of the same prompt before retrying (default %(default)s)")
     p.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT, help="seconds per model call (default %(default)s)")
     p.add_argument("--budget", type=int, default=DEFAULT_BUDGET, help="maximum prompt tokens per call (default %(default)s)")
     p.add_argument("--json", action="store_true", help="machine-readable report on stdout")
@@ -675,8 +663,6 @@ def parse_args(argv):
         raise AfmError(EXIT_USAGE, "usage: " + USAGE)
     if args.retries < 0:
         raise AfmError(EXIT_USAGE, "--retries must be 0 or more")
-    if args.samples < 1:
-        raise AfmError(EXIT_USAGE, "--samples must be at least 1")
     if not (args.timeout > 0) or math.isinf(args.timeout):
         raise AfmError(EXIT_USAGE, "--timeout must be a positive number of seconds")
     if args.budget < 1:
