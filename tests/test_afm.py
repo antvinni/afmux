@@ -114,5 +114,61 @@ class UsageTests(unittest.TestCase):
         self.assertEqual(fm_calls(tmp), [])
 
 
+SANDBOX_MSG = "Error: The operation couldn\u2019t be completed. (ModelManagerServices.ModelManagerError error 1008.)\n"
+
+
+class FmWrapperTests(unittest.TestCase):
+    def test_fm_missing_is_exit_4(self):
+        p = run_afm(["summarise"], stdin="hello", env={"PATH": "/nonexistent"})
+        self.assertEqual(p.returncode, 4, p.stderr)
+        self.assertEqual(p.stdout, "")
+        self.assertIn("fm not found", p.stderr)
+
+    def test_sandbox_on_count_tokens_is_exit_5_before_respond(self):
+        tmp = tempfile.mkdtemp()
+        p = run_afm(["summarise"], stdin="hello", tmp=tmp,
+                    env={"FAKEFM_COUNT_EXIT": "1", "FAKEFM_COUNT_STDERR": SANDBOX_MSG})
+        self.assertEqual(p.returncode, 5, p.stderr)
+        self.assertIn("blocked by a sandbox", p.stderr)
+        self.assertEqual([c["cmd"][0] for c in fm_calls(tmp)], ["count-tokens"])
+
+    def test_other_count_failure_is_exit_1_with_stderr(self):
+        p = run_afm(["summarise"], stdin="hello",
+                    env={"FAKEFM_COUNT_EXIT": "1", "FAKEFM_COUNT_STDERR": "Error: something else\n"})
+        self.assertEqual(p.returncode, 1, p.stderr)
+        self.assertIn("something else", p.stderr)
+
+    def test_count_includes_instructions(self):
+        tmp = tempfile.mkdtemp()
+        run_afm(["summarise"], stdin="hello", tmp=tmp)
+        count = [c for c in fm_calls(tmp) if c["cmd"][0] == "count-tokens"][0]
+        self.assertIn("-q", count["cmd"])
+        self.assertIn("-i", count["cmd"])
+        self.assertIn("Summarise the input", count["cmd"][count["cmd"].index("-i") + 1])
+        self.assertEqual(count["stdin"], "hello")
+
+
+class BudgetTests(unittest.TestCase):
+    def test_over_budget_is_exit_6_with_numbers(self):
+        tmp = tempfile.mkdtemp()
+        p = run_afm(["summarise", "--budget", "100"], stdin="x" * 1000, tmp=tmp)
+        self.assertEqual(p.returncode, 6, p.stderr)
+        self.assertEqual(p.stdout, "")
+        self.assertIn("budget is 100", p.stderr)
+        self.assertIn("rerun with --chunk", p.stderr)
+        self.assertEqual([c["cmd"][0] for c in fm_calls(tmp)], ["count-tokens"])
+
+    def test_schema_counts_toward_budget(self):
+        tmp = tempfile.mkdtemp()
+        schema = os.path.join(tmp, "s.json")
+        with open(schema, "w") as f:
+            f.write("{" + "x" * 400 + "}")
+        # input ~25 tokens + instructions, schema ~100 tokens, budget 110 -> over
+        p = run_afm(["extract", "--schema", schema, "--budget", "110"], stdin="x" * 100, tmp=tmp)
+        self.assertEqual(p.returncode, 6, p.stderr)
+        counts = [c for c in fm_calls(tmp) if c["cmd"][0] == "count-tokens"]
+        self.assertEqual(len(counts), 2)
+
+
 if __name__ == "__main__":
     unittest.main()

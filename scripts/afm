@@ -6,6 +6,7 @@ model unavailable, 5 blocked by a sandbox, 6 input over budget.
 """
 import argparse
 import os
+import subprocess
 import sys
 
 EXIT_OK, EXIT_FM, EXIT_USAGE, EXIT_JSON, EXIT_UNAVAILABLE, EXIT_SANDBOX, EXIT_BUDGET = 0, 1, 2, 3, 4, 5, 6
@@ -125,6 +126,55 @@ def read_input():
     return text
 
 
+_CHILD = None
+_TEMP_FILES = []
+
+
+def run_fm(args, stdin_text, timeout=None):
+    """Run fm with one failure policy: cannot run -> 4, sandbox 1008 -> 5, timeout -> 1."""
+    global _CHILD
+    try:
+        proc = subprocess.Popen(["fm"] + args, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE, text=True)
+    except OSError as e:
+        raise AfmError(EXIT_UNAVAILABLE, "fm not found or not executable (%s)" % e)
+    _CHILD = proc
+    try:
+        out, err = proc.communicate(stdin_text, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.communicate()
+        raise AfmError(EXIT_FM, "timed out after %g s" % timeout)
+    finally:
+        _CHILD = None
+    if proc.returncode != 0 and "ModelManager" in err and "1008" in err:
+        raise AfmError(EXIT_SANDBOX, "fm is blocked by a sandbox; run afm outside it")
+    return proc.returncode, out, err
+
+
+def count_tokens(text, instructions=""):
+    args = ["count-tokens", "-q"]
+    if instructions:
+        args += ["-i", instructions]
+    code, out, err = run_fm(args, text)
+    if code != 0:
+        raise AfmError(EXIT_FM, err.strip() or "fm count-tokens failed with exit %d" % code)
+    try:
+        return int(out.strip())
+    except ValueError:
+        raise AfmError(EXIT_FM, "fm count-tokens returned %r" % out.strip())
+
+
+def schema_tokens(path):
+    with open(path) as f:
+        return count_tokens(f.read())
+
+
+def check_budget(total, budget, chunk):
+    if total > budget and not chunk:
+        raise AfmError(EXIT_BUDGET, "input is %d tokens, budget is %d; rerun with --chunk" % (total, budget))
+
+
 def main(argv):
     try:
         args = parse_args(argv)
@@ -134,6 +184,9 @@ def main(argv):
             return EXIT_OK
         job = resolve_job(args)
         text = read_input()
+        overhead = schema_tokens(job.schema_path) if job.schema_path else 0
+        total = count_tokens(text, job.instructions) + overhead
+        check_budget(total, args.budget, args.chunk)
         sys.stderr.write("afm: not implemented\n")
         return EXIT_USAGE
     except AfmError as e:
