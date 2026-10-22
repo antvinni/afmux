@@ -6,6 +6,7 @@ model unavailable, 5 blocked by a sandbox, 6 input over budget.
 """
 import argparse
 import os
+import signal
 import subprocess
 import sys
 
@@ -175,7 +176,53 @@ def check_budget(total, budget, chunk):
         raise AfmError(EXIT_BUDGET, "input is %d tokens, budget is %d; rerun with --chunk" % (total, budget))
 
 
+def respond(job, text, args, schema_path):
+    cmd = ["respond", "--no-stream", "--greedy", "-i", job.instructions,
+           "--guardrails", args.guardrails, "--use-case", args.use_case]
+    if schema_path:
+        cmd += ["--schema", schema_path]
+    code, out, err = run_fm(cmd, text, timeout=args.timeout)
+    if code != 0:
+        acode, _, aerr = run_fm(["available"], "")
+        if acode != 0:
+            raise AfmError(EXIT_UNAVAILABLE, aerr.strip() or "model not available")
+        raise AfmError(EXIT_FM, err.strip() or "fm respond failed with exit %d" % code)
+    return out
+
+
+def cleanup():
+    while _TEMP_FILES:
+        path = _TEMP_FILES.pop()
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+
+
+def _on_signal(signum, frame):
+    child = _CHILD
+    if child is not None and child.poll() is None:
+        try:
+            child.kill()
+        except OSError:
+            pass
+    cleanup()
+    sys.stderr.write("afm: interrupted by signal %d\n" % signum)
+    sys.stderr.flush()
+    os._exit(EXIT_FM)
+
+
+def install_signal_handlers():
+    for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+        signal.signal(sig, _on_signal)
+
+
+def emit_text(answer):
+    sys.stdout.write(answer.rstrip() + "\n")
+
+
 def main(argv):
+    install_signal_handlers()
     try:
         args = parse_args(argv)
         if args.list:
@@ -184,14 +231,18 @@ def main(argv):
             return EXIT_OK
         job = resolve_job(args)
         text = read_input()
-        overhead = schema_tokens(job.schema_path) if job.schema_path else 0
+        schema_path = job.schema_path
+        overhead = schema_tokens(schema_path) if schema_path else 0
         total = count_tokens(text, job.instructions) + overhead
         check_budget(total, args.budget, args.chunk)
-        sys.stderr.write("afm: not implemented\n")
-        return EXIT_USAGE
+        answer = respond(job, text, args, schema_path)
+        emit_text(answer)
+        return EXIT_OK
     except AfmError as e:
         sys.stderr.write("afm: %s\n" % e.message)
         return e.code
+    finally:
+        cleanup()
 
 
 if __name__ == "__main__":

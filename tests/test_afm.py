@@ -170,5 +170,100 @@ class BudgetTests(unittest.TestCase):
         self.assertEqual(len(counts), 2)
 
 
+class RespondTests(unittest.TestCase):
+    def test_success_prints_answer_only(self):
+        tmp = tempfile.mkdtemp()
+        p = run_afm(["summarise"], stdin="hello world", tmp=tmp, env={"FAKEFM_RESPOND_STDOUT": "A summary.  \n\n"})
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertEqual(p.stdout, "A summary.\n")
+        self.assertEqual(p.stderr, "")
+
+    def test_respond_arguments(self):
+        tmp = tempfile.mkdtemp()
+        run_afm(["summarise", "--guardrails", "default", "--use-case", "content-tagging"], stdin="hello", tmp=tmp)
+        r = [c for c in fm_calls(tmp) if c["cmd"][0] == "respond"][0]
+        cmd = r["cmd"]
+        for flag in ("--no-stream", "--greedy"):
+            self.assertIn(flag, cmd)
+        self.assertEqual(cmd[cmd.index("--guardrails") + 1], "default")
+        self.assertEqual(cmd[cmd.index("--use-case") + 1], "content-tagging")
+        self.assertIn("Summarise the input", cmd[cmd.index("-i") + 1])
+        self.assertNotIn("--schema", cmd)
+        self.assertEqual(r["stdin"], "hello")
+
+    def test_default_guardrails_permissive(self):
+        tmp = tempfile.mkdtemp()
+        run_afm(["summarise"], stdin="hello", tmp=tmp)
+        cmd = [c for c in fm_calls(tmp) if c["cmd"][0] == "respond"][0]["cmd"]
+        self.assertEqual(cmd[cmd.index("--guardrails") + 1], "permissive-content-transformations")
+        self.assertEqual(cmd[cmd.index("--use-case") + 1], "general")
+
+    def test_refusal_is_exit_1_with_stderr(self):
+        tmp = tempfile.mkdtemp()
+        p = run_afm(["summarise"], stdin="hello", tmp=tmp, env={
+            "FAKEFM_RESPOND_EXIT": "1",
+            "FAKEFM_RESPOND_STDERR": "Error: The model's safety guardrails were triggered.\n"})
+        self.assertEqual(p.returncode, 1)
+        self.assertEqual(p.stdout, "")
+        self.assertIn("safety guardrails", p.stderr)
+        self.assertEqual([c["cmd"][0] for c in fm_calls(tmp)], ["count-tokens", "respond", "available"])
+
+    def test_respond_failure_with_model_unavailable_is_exit_4(self):
+        p = run_afm(["summarise"], stdin="hello", env={
+            "FAKEFM_RESPOND_EXIT": "1", "FAKEFM_RESPOND_STDERR": "Error: x\n",
+            "FAKEFM_AVAILABLE_EXIT": "1", "FAKEFM_AVAILABLE_STDERR": "Model not available\n"})
+        self.assertEqual(p.returncode, 4, p.stderr)
+        self.assertIn("not available", p.stderr)
+
+    def test_sandbox_on_respond_is_exit_5(self):
+        p = run_afm(["summarise"], stdin="hello", env={"FAKEFM_COUNT": "10",
+                    "FAKEFM_RESPOND_EXIT": "1", "FAKEFM_RESPOND_STDERR": SANDBOX_MSG})
+        self.assertEqual(p.returncode, 5, p.stderr)
+
+    def test_timeout_is_exit_1_and_kills_child(self):
+        tmp = tempfile.mkdtemp()
+        p = run_afm(["summarise", "--timeout", "0.5"], stdin="hello", tmp=tmp, env={"FAKEFM_RESPOND_DELAY": "5"})
+        self.assertEqual(p.returncode, 1, p.stderr)
+        self.assertIn("timed out after 0.5 s", p.stderr)
+        pid = [c for c in fm_calls(tmp) if c["cmd"][0] == "respond"][0]["pid"]
+        self.assert_gone(pid)
+
+    def assert_gone(self, pid):
+        for _ in range(50):
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                return
+            time.sleep(0.1)
+        self.fail("fm child %d still alive" % pid)
+
+
+class SignalTests(unittest.TestCase):
+    def test_sigterm_kills_child_and_removes_temp_schema(self):
+        tmp = tempfile.mkdtemp()
+        e = dict(os.environ)
+        e["PATH"] = FAKEFM + os.pathsep + e.get("PATH", "")
+        e["FAKEFM_LOG"] = os.path.join(tmp, "fm.log")
+        e["TMPDIR"] = tmp
+        e["FAKEFM_RESPOND_DELAY"] = "10"
+        proc = subprocess.Popen([sys.executable, AFM, "classify", "--labels", "a,b"], stdin=subprocess.PIPE,
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=e)
+        proc.stdin.write("hello")
+        proc.stdin.close()
+        for _ in range(50):
+            if any(c["cmd"][0] == "respond" for c in fm_calls(tmp)):
+                break
+            time.sleep(0.1)
+        child = [c for c in fm_calls(tmp) if c["cmd"][0] == "respond"][0]["pid"]
+        self.assertTrue(any(n.endswith(".json") for n in os.listdir(tmp)), "temp schema should exist while running")
+        proc.send_signal(signal.SIGTERM)
+        out, err = proc.communicate(timeout=5)
+        self.assertEqual(proc.returncode, 1)
+        self.assertEqual(out, "")
+        self.assertIn("interrupted", err)
+        RespondTests.assert_gone(self, child)
+        self.assertFalse(any(n.endswith(".json") for n in os.listdir(tmp)), "temp schema should be removed")
+
+
 if __name__ == "__main__":
     unittest.main()
