@@ -782,6 +782,100 @@ class ReadTests(unittest.TestCase):
         self.assertIn("boom", p.stderr)
 
 
+class ReadFixTests(unittest.TestCase):
+    NOT_FOUND = json.dumps({"found": False, "quote": ""})
+
+    def test_paragraph_larger_than_a_chunk_is_split_at_lines(self):
+        pr = Project()
+        log = "\n".join("2026-10-22 INFO line %d of a log with no blank lines" % i for i in range(1, 401))
+        pr.write("app.log", log)
+        for _ in range(200):
+            pr.reply(self.NOT_FOUND)
+        p = pr.run(["read", "app.log", "--ask", "q", "--chunk-tokens", "500"])
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        chunks = [r["stdin"].split("---\n", 1)[1] for r in pr.responds()]
+        self.assertGreater(len(chunks), 4)
+        self.assertTrue(pr.responds()[0]["stdin"].startswith("Chunk lines 1-"))
+        self.assertEqual("\n".join(chunks), log)
+
+    def test_line_longer_than_a_chunk_is_split(self):
+        pr = Project()
+        pr.write("min.json", "x" * 20000 + "\n")
+        for _ in range(200):
+            pr.reply(self.NOT_FOUND)
+        p = pr.run(["read", "min.json", "--ask", "q", "--chunk-tokens", "500"])
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        chunks = [r["stdin"].split("---\n", 1)[1] for r in pr.responds()]
+        self.assertGreater(len(chunks), 4)
+        self.assertEqual("".join(chunks), "x" * 20000)
+
+    def test_one_failed_chunk_does_not_end_the_read(self):
+        pr = Project()
+        pr.write("doc.md", DOC)
+        for _ in range(40):
+            pr.reply(json.dumps({"found": True, "quote": "turned on with the enabled key"}))
+        p = pr.run(["read", "doc.md", "--ask", "q", "--chunk-tokens", "200"], env={
+            "FAKEFM_RESPOND_FAIL_ON_CALL": "1", "FAKEFM_RESPOND_EXIT": "1",
+            "FAKEFM_RESPOND_STDERR": "Error: The model's safety guardrails were triggered.\n"})
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertIn("1 failed: chunk lines 1-1", p.stdout)
+        self.assertIn("enabled key", p.stdout)
+        d = json.loads(pr.run(["read", "doc.md", "--ask", "q", "--chunk-tokens", "200", "--json"]).stdout)
+        self.assertNotIn("failed", d, "the second run has no failures, so no failed key")
+
+    def test_quote_is_cited_by_its_own_lines(self):
+        pr = Project()
+        pr.write("notes.md", "intro line\nsecond line\nthe key fact is here\nlast line\n")
+        pr.reply(json.dumps({"found": True, "quote": "the key fact is here"}))
+        p = pr.run(["read", "notes.md", "--ask", "q"])
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertIn('[lines 3-3] "the key fact is here"', p.stdout)
+
+
+class SamplesTests(unittest.TestCase):
+    def test_samples_are_tried_before_the_retry(self):
+        pr = Project()
+        pr.write("test_util.py", SLUGIFY_TESTS)
+        pr.step("01-slugify")
+        pr.reply(BAD_SLUGIFY)
+        pr.reply("def slugify(title):\n    return title.lower()\n")
+        pr.reply(GOOD_SLUGIFY)
+        p = pr.run(["run", "steps", "--samples", "3"])
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        cmds = [r["cmd"] for r in pr.responds()]
+        self.assertEqual(["--greedy" in c for c in cmds], [True, False, False])
+        self.assertNotIn("Your previous implementation", pr.responds()[2]["stdin"], "a sample uses the first prompt")
+        self.assertEqual(pr.read("util.py"), GOOD_SLUGIFY)
+
+    def test_identical_sample_is_not_retested(self):
+        pr = Project()
+        pr.step("01-x", test="python3 -c \"open('runs','a').write('x'); raise SystemExit(1)\"")
+        pr.reply("x = 1\n")
+        pr.reply("x = 1\n")
+        pr.reply("x = 2\n")
+        p = pr.run(["run", "steps", "--samples", "2"])
+        self.assertEqual(p.returncode, 1)
+        self.assertEqual(pr.read("runs"), "xx", "the identical sample is skipped, the retry is tested")
+        self.assertIn("attempt 2 produced identical code", p.stdout)
+
+    def test_default_is_one_sample(self):
+        pr = Project()
+        pr.write("test_util.py", SLUGIFY_TESTS)
+        pr.step("01-slugify")
+        pr.reply(BAD_SLUGIFY)
+        pr.reply(GOOD_SLUGIFY)
+        pr.run(["run", "steps"])
+        self.assertEqual(len(pr.responds()), 2)
+        self.assertIn("Your previous implementation", pr.responds()[1]["stdin"])
+
+    def test_bad_samples_is_usage(self):
+        pr = Project()
+        pr.step("01-a")
+        p = pr.run(["run", "steps", "--samples", "0"])
+        self.assertEqual(p.returncode, 2)
+        self.assertIn("--samples must be at least 1", p.stderr)
+
+
 class SignalTests(unittest.TestCase):
     def test_sigterm_kills_child(self):
         pr = Project()

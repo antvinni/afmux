@@ -50,7 +50,7 @@ afm read docs/guide.md --ask "Which setting turns the sandbox off?"   # one ques
 afm read docs/guide.md --ask "..." --chunk-tokens 1500                 # default 600; bigger chunks are faster but miss more
 ```
 
-`afm` splits the file into chunks, asks the model per chunk whether it contains a passage that answers the question, and prints only verified quotes with line ranges (a quote that is not in the file is dropped). You never see the file. Answer from the quotes and cite the lines; expect some irrelevant matches, and read the file only if nothing useful comes back. Borrowed from the MinionS protocol (HazyResearch), where the cloud model never reads the document.
+`afm` splits the file into chunks, asks the model per chunk whether it contains a passage that answers the question, and prints only verified quotes with line ranges (a quote that is not in the file is dropped). You never see the file; logs without blank lines are split at lines, and a chunk the model refuses is counted and skipped. Answer from the quotes and cite the lines they give; expect some irrelevant matches, and read the file only if nothing useful comes back. Borrowed from the MinionS protocol (HazyResearch), where the cloud model never reads the document.
 
 ### Exit codes
 

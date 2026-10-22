@@ -113,6 +113,7 @@ afm step <step-file> [options]    run one step
 | option | meaning | default |
 |---|---|---|
 | `--retries N` | retries per step, each with the failing test output | 1 |
+| `--samples N` | after the greedy first attempt fails, up to N-1 sampled attempts of the same first prompt are tested before the retries; an attempt identical to an earlier one is noted and not retested | 1 |
 | `--timeout S` | per `fm` call | 120 |
 | `--budget T` | maximum prompt tokens per call | 7168 |
 | `--json` | machine-readable report on stdout | off |
@@ -248,19 +249,28 @@ the agent spends one line rather than cloud tokens writing job code:
    chunks of about `--chunk-tokens` (default 600; measured: 1500-token chunks
    missed the decisive sentence for one of three questions, 600-token chunks
    found it, matching the paper's finding that chunk size is the strongest
-   lever).
+   lever). A paragraph bigger than one chunk is split into its lines, and a
+   line bigger than one chunk into pieces: without that a file with no blank
+   lines (most logs) is one chunk, overflows the context and fails the read.
 2. For each chunk, one greedy call with a `found`/`quote` schema: set
    `found` and copy a passage of one to three sentences exactly, or abstain.
    There is no free-text answer field: measured, the model's answers
    overreached beyond their quotes, and the quote is the only part that can
    be verified.
 3. Drop abstentions and any quote not present in its chunk (whitespace and
-   case normalised). Print survivors as `[lines a-b] "quote"` with a header
-   line giving matched and dropped counts and the tokens read locally.
+   case normalised). Print survivors as `[lines a-b] "quote"`, where a-b are
+   the lines the quote itself spans, with a header line giving matched and
+   dropped counts and the tokens read locally. A chunk whose call fails (a
+   refusal, a timeout) is counted as failed and the read continues; only when
+   every chunk fails is it exit 1.
 4. One question per call; the agent synthesises and cites line ranges.
 
 What the model cannot borrow: MinionS gains up to 7 points from sampling each
-job many times; `fm` is nearly deterministic and has no temperature flag.
+job many times; `fm` is nearly deterministic and has no temperature flag. Measured for `afm run --samples 3` on a calendar module that greedy
+decoding fails: through `fm`, 0 of 5 runs passed (every sample repeated the
+same `parse_date` bug); the Swift engine (afmux-swift), which sets seeded
+top-p 0.95 sampling in-process, passed on its third attempt. So `--samples`
+exists for parity but does not help through the `fm` CLI.
 
 Measured 2026-10-22 on a 1,060-line, 23.5k-token documentation page with
 five questions, Opus headless, five runs per arm (two at 1500-token chunks,
