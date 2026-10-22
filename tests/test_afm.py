@@ -689,6 +689,99 @@ class Round4Tests(unittest.TestCase):
         self.assertNotIn("--greedy", second)
 
 
+DOC = "\n\n".join(["Chapter %d. " % i + ("Nothing of note here. " * 30) for i in range(1, 7)]
+                  + ["Chapter 7. The sandbox is turned on with the enabled key. " + ("Filler sentence. " * 30)]
+                  + ["Chapter %d. " % i + ("More filler text here. " * 30) for i in range(8, 12)])
+
+
+class ReadTests(unittest.TestCase):
+    def found(self, answer, quote):
+        return json.dumps({"found": True, "answer": answer, "quote": quote})
+
+    def test_usage(self):
+        pr = Project()
+        p = pr.run(["read", "nosuch.md", "--ask", "q"])
+        self.assertEqual(p.returncode, 2, p.stderr)
+        pr.write("doc.md", DOC)
+        p = pr.run(["read", "doc.md"])
+        self.assertEqual(p.returncode, 2, p.stderr)
+        self.assertIn("--ask", p.stderr)
+
+    def test_chunks_are_small_and_cover_the_file(self):
+        pr = Project()
+        pr.write("doc.md", DOC)
+        for _ in range(40):
+            pr.reply(json.dumps({"found": False, "answer": "", "quote": ""}))
+        p = pr.run(["read", "doc.md", "--ask", "How is the sandbox turned on?", "--chunk-tokens", "200"])
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        chunks = [r["stdin"] for r in pr.responds()]
+        self.assertGreater(len(chunks), 3)
+        self.assertEqual("".join(c.split("---\n", 1)[1] for c in chunks).replace("\n", ""), DOC.replace("\n", ""))
+        self.assertIn("no chunk answered", p.stdout)
+
+    def test_schema_and_question_are_sent(self):
+        pr = Project()
+        pr.write("doc.md", DOC)
+        pr.reply(self.found("With the enabled key.", "turned on with the enabled key"))
+        p = pr.run(["read", "doc.md", "--ask", "How is the sandbox turned on?", "--chunk-tokens", "100000"])
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        r = pr.responds()[0]
+        self.assertIn("How is the sandbox turned on?", instr_of(r["cmd"]) + r["stdin"])
+        schema = json.loads(r["schema"])
+        self.assertEqual(schema["x-order"], ["found", "answer", "quote"])
+        self.assertIn("enabled key", p.stdout)
+
+    def test_abstentions_dropped_and_survivors_cite_lines(self):
+        pr = Project()
+        pr.write("doc.md", DOC)
+        for _ in range(40):
+            pr.reply(json.dumps({"found": False, "answer": "", "quote": ""}))
+        # chunk size 200 tokens -> many chunks; the fake answers "found" only where we say
+        pr.replies = 0
+        chunks_total = None
+        p0 = pr.run(["read", "doc.md", "--ask", "q", "--chunk-tokens", "200"])
+        chunks_total = len(pr.responds())
+        pr2 = Project()
+        pr2.write("doc.md", DOC)
+        target = [i for i, c in enumerate([r["stdin"] for r in pr.responds()]) if "enabled key" in c][0]
+        for i in range(chunks_total):
+            if i == target:
+                pr2.reply(self.found("Set the enabled key.", "turned on with the enabled key"))
+            else:
+                pr2.reply(json.dumps({"found": False, "answer": "", "quote": ""}))
+        p = pr2.run(["read", "doc.md", "--ask", "q", "--chunk-tokens", "200"])
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertIn("1 of %d chunks" % chunks_total, p.stdout)
+        self.assertIn("Set the enabled key.", p.stdout)
+        self.assertIn("lines", p.stdout)
+
+    def test_answer_whose_quote_is_not_in_the_chunk_is_dropped(self):
+        pr = Project()
+        pr.write("doc.md", DOC)
+        pr.reply(self.found("Made up.", "this text is not in the document"))
+        p = pr.run(["read", "doc.md", "--ask", "q", "--chunk-tokens", "100000"])
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertIn("no chunk answered", p.stdout)
+        self.assertIn("1 dropped", p.stdout)
+
+    def test_json_output(self):
+        pr = Project()
+        pr.write("doc.md", DOC)
+        pr.reply(self.found("A.", "enabled key"))
+        p = pr.run(["read", "doc.md", "--ask", "q", "--chunk-tokens", "100000", "--json"])
+        d = json.loads(p.stdout)
+        self.assertEqual(d["chunks"], 1)
+        self.assertEqual(d["answers"][0]["answer"], "A.")
+        self.assertIn("lines", d["answers"][0])
+
+    def test_fm_failure_on_a_chunk_is_exit_1(self):
+        pr = Project()
+        pr.write("doc.md", DOC)
+        p = pr.run(["read", "doc.md", "--ask", "q", "--chunk-tokens", "100000"], env={"FAKEFM_RESPOND_SEQ": "", "FAKEFM_RESPOND_EXIT": "1", "FAKEFM_RESPOND_STDERR": "Error: boom\n"})
+        self.assertEqual(p.returncode, 1, p.stdout + p.stderr)
+        self.assertIn("boom", p.stderr)
+
+
 class SignalTests(unittest.TestCase):
     def test_sigterm_kills_child(self):
         pr = Project()
