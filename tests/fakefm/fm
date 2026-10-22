@@ -1,0 +1,72 @@
+#!/usr/bin/env python3
+"""Fake fm CLI for tests. Behaviour comes from FAKEFM_* environment variables."""
+import json
+import math
+import os
+import sys
+import time
+
+
+def env(name, default=None):
+    return os.environ.get(name, default)
+
+
+def log(cmd, stdin):
+    path = env("FAKEFM_LOG")
+    if path:
+        with open(path, "a") as f:
+            f.write(json.dumps({"cmd": cmd, "stdin": stdin, "pid": os.getpid()}) + "\n")
+
+
+def count_calls(sub):
+    path = env("FAKEFM_LOG")
+    if not path or not os.path.exists(path):
+        return 0
+    with open(path) as f:
+        return sum(1 for line in f if json.loads(line)["cmd"][0] == sub)
+
+
+def main():
+    cmd = sys.argv[1:]
+    sub = cmd[0] if cmd else ""
+    stdin = "" if sys.stdin.isatty() else sys.stdin.read()
+    log(cmd, stdin)
+    if sub == "available":
+        sys.stderr.write(env("FAKEFM_AVAILABLE_STDERR", ""))
+        sys.exit(int(env("FAKEFM_AVAILABLE_EXIT", "0")))
+    if sub == "count-tokens":
+        code = int(env("FAKEFM_COUNT_EXIT", "0"))
+        if code:
+            sys.stderr.write(env("FAKEFM_COUNT_STDERR", ""))
+            sys.exit(code)
+        fixed = env("FAKEFM_COUNT")
+        if fixed is not None:
+            print(fixed)
+        else:
+            instr = cmd[cmd.index("-i") + 1] if "-i" in cmd else ""
+            nbytes = len(stdin.encode()) + len(instr.encode())
+            print(math.ceil(nbytes / 4))
+        sys.exit(0)
+    if sub == "respond":
+        n = count_calls("respond")  # this call included
+        delay = float(env("FAKEFM_RESPOND_DELAY", "0"))
+        if delay:
+            time.sleep(delay)
+        fail_on = env("FAKEFM_RESPOND_FAIL_ON_CALL")
+        code = int(env("FAKEFM_RESPOND_EXIT", "0"))
+        if fail_on is not None and n != int(fail_on):
+            code = 0
+        if code:
+            sys.stderr.write(env("FAKEFM_RESPOND_STDERR", ""))
+            sys.exit(code)
+        if env("FAKEFM_RESPOND_MODE") == "first-line":
+            print(stdin.split("\n", 1)[0])
+        else:
+            print(env("FAKEFM_RESPOND_STDOUT", "OK"))
+        sys.exit(0)
+    sys.stderr.write("fakefm: unknown subcommand %r\n" % sub)
+    sys.exit(64)
+
+
+if __name__ == "__main__":
+    main()

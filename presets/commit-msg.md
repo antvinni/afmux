@@ -1,0 +1,1 @@
+Write a git commit message for this diff in the conventional commits style. First line: type(scope): summary, imperative mood, under 72 characters. If the change needs explanation, add a blank line and one short paragraph saying why, not what. Output the message only.
