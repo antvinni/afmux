@@ -4,6 +4,7 @@
 Exit codes: 0 ok, 1 fm failed, 2 usage, 3 bad JSON or label, 4 fm missing or
 model unavailable, 5 blocked by a sandbox, 6 input over budget.
 """
+import argparse
 import os
 import sys
 
@@ -35,13 +36,109 @@ def list_presets():
     return out
 
 
+PRESET_NAMES = ("summarise", "classify", "extract", "commit-msg")
+USAGE = "usage: afm <preset> [options] < input | afm ask \"<instructions>\" [options] < input | afm --list"
+
+
+class Job(object):
+    def __init__(self, name, instructions, labels=None, schema_path=None):
+        self.name = name
+        self.instructions = instructions
+        self.labels = labels
+        self.schema_path = schema_path
+
+
+class _Parser(argparse.ArgumentParser):
+    def error(self, message):
+        raise AfmError(EXIT_USAGE, "%s\n%s" % (message, USAGE))
+
+
+def parse_args(argv):
+    p = _Parser(prog="afm", add_help=True, usage=USAGE)
+    p.add_argument("job", nargs="?", help="preset name or 'ask'")
+    p.add_argument("instructions", nargs="?", help="instructions, with 'ask' only")
+    p.add_argument("--labels", help="classify only: comma-separated allowed labels")
+    p.add_argument("--schema", help="JSON schema file for structured output")
+    p.add_argument("--guardrails", default=DEFAULT_GUARDRAILS)
+    p.add_argument("--use-case", dest="use_case", default=DEFAULT_USE_CASE)
+    p.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT)
+    p.add_argument("--budget", type=int, default=DEFAULT_BUDGET)
+    p.add_argument("--chunk", action="store_true")
+    p.add_argument("--max-chunks", dest="max_chunks", type=int, default=DEFAULT_MAX_CHUNKS)
+    p.add_argument("--list", action="store_true")
+    return p.parse_args(argv)
+
+
+def parse_labels(text):
+    labels = [x.strip() for x in text.split(",")]
+    if any(not x for x in labels):
+        raise AfmError(EXIT_USAGE, "empty label in --labels (labels are comma-separated and cannot contain commas)")
+    if len(set(labels)) != len(labels):
+        raise AfmError(EXIT_USAGE, "duplicate label in --labels")
+    return labels
+
+
+def load_preset(name):
+    path = os.path.join(PRESETS_DIR, name + ".md")
+    with open(path) as f:
+        return f.read().strip()
+
+
+def resolve_job(args):
+    if not args.job:
+        raise AfmError(EXIT_USAGE, USAGE)
+    if args.job == "ask":
+        if not args.instructions:
+            raise AfmError(EXIT_USAGE, "ask needs instructions as its argument")
+        instructions = args.instructions
+    elif args.job in PRESET_NAMES:
+        if args.instructions:
+            raise AfmError(EXIT_USAGE, "unexpected argument %r (only ask takes instructions)" % args.instructions)
+        instructions = load_preset(args.job)
+    else:
+        raise AfmError(EXIT_USAGE, "unknown preset %r; run afm --list" % args.job)
+    labels = None
+    if args.job == "classify":
+        if not args.labels:
+            raise AfmError(EXIT_USAGE, "classify needs --labels a,b,c")
+        if args.schema:
+            raise AfmError(EXIT_USAGE, "--schema is not allowed with classify (its schema is generated)")
+        labels = parse_labels(args.labels)
+        instructions = instructions.replace("{labels}", ", ".join(labels))
+    elif args.labels:
+        raise AfmError(EXIT_USAGE, "--labels is only for classify")
+    if args.job == "extract" and not args.schema:
+        raise AfmError(EXIT_USAGE, "extract needs --schema FILE")
+    if args.job == "commit-msg" and args.chunk:
+        raise AfmError(EXIT_USAGE, "--chunk is not allowed with commit-msg; pipe a smaller diff")
+    if args.schema and not os.path.isfile(args.schema):
+        raise AfmError(EXIT_USAGE, "schema file not found: %s" % args.schema)
+    return Job(args.job, instructions, labels, args.schema)
+
+
+def read_input():
+    if sys.stdin.isatty():
+        raise AfmError(EXIT_USAGE, "afm reads its input from stdin; pipe or redirect it")
+    text = sys.stdin.read()
+    if not text.strip():
+        raise AfmError(EXIT_USAGE, "input is empty")
+    return text
+
+
 def main(argv):
-    if argv == ["--list"]:
-        for name, first in list_presets():
-            print("%-12s %s" % (name, first))
-        return EXIT_OK
-    sys.stderr.write("afm: not implemented\n")
-    return EXIT_USAGE
+    try:
+        args = parse_args(argv)
+        if args.list:
+            for name, first in list_presets():
+                print("%-12s %s" % (name, first))
+            return EXIT_OK
+        job = resolve_job(args)
+        text = read_input()
+        sys.stderr.write("afm: not implemented\n")
+        return EXIT_USAGE
+    except AfmError as e:
+        sys.stderr.write("afm: %s\n" % e.message)
+        return e.code
 
 
 if __name__ == "__main__":

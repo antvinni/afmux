@@ -58,5 +58,61 @@ class ListTests(unittest.TestCase):
         self.assertEqual(fm_calls(tmp), [])
 
 
+class UsageTests(unittest.TestCase):
+    def assert_usage(self, args, stdin="hello", stdin_tty=False, needle=""):
+        p = run_afm(args, stdin=stdin, stdin_tty=stdin_tty)
+        self.assertEqual(p.returncode, 2, p.stderr)
+        self.assertEqual(p.stdout, "")
+        self.assertIn(needle, p.stderr)
+        return p
+
+    def test_unknown_preset(self):
+        self.assert_usage(["nosuch"], needle="unknown preset")
+
+    def test_no_job(self):
+        self.assert_usage([], needle="usage")
+
+    def test_ask_needs_instructions(self):
+        self.assert_usage(["ask"], needle="instructions")
+
+    def test_tty_stdin(self):
+        self.assert_usage(["summarise"], stdin_tty=True, needle="reads its input from stdin")
+
+    def test_empty_stdin(self):
+        self.assert_usage(["summarise"], stdin="", needle="empty")
+
+    def test_whitespace_only_stdin(self):
+        self.assert_usage(["summarise"], stdin="  \n\n", needle="empty")
+
+    def test_classify_needs_labels(self):
+        self.assert_usage(["classify"], needle="--labels")
+
+    def test_labels_empty_item(self):
+        self.assert_usage(["classify", "--labels", "a,,b"], needle="empty label")
+
+    def test_labels_duplicate(self):
+        self.assert_usage(["classify", "--labels", "a,b,a"], needle="duplicate")
+
+    def test_labels_on_other_preset(self):
+        self.assert_usage(["summarise", "--labels", "a,b"], needle="--labels")
+
+    def test_classify_rejects_schema(self):
+        self.assert_usage(["classify", "--labels", "a,b", "--schema", "x.json"], needle="--schema")
+
+    def test_extract_needs_schema(self):
+        self.assert_usage(["extract"], needle="--schema")
+
+    def test_schema_file_missing(self):
+        self.assert_usage(["extract", "--schema", "/nonexistent.json"], needle="schema")
+
+    def test_chunk_with_commit_msg(self):
+        self.assert_usage(["commit-msg", "--chunk"], needle="--chunk")
+
+    def test_usage_errors_make_no_fm_calls(self):
+        tmp = tempfile.mkdtemp()
+        run_afm(["classify"], stdin="x", tmp=tmp)
+        self.assertEqual(fm_calls(tmp), [])
+
+
 if __name__ == "__main__":
     unittest.main()
