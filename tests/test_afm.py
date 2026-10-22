@@ -832,6 +832,50 @@ class ReadFixTests(unittest.TestCase):
         self.assertIn('[lines 3-3] "the key fact is here"', p.stdout)
 
 
+class SamplesTests(unittest.TestCase):
+    def test_samples_are_tried_before_the_retry(self):
+        pr = Project()
+        pr.write("test_util.py", SLUGIFY_TESTS)
+        pr.step("01-slugify")
+        pr.reply(BAD_SLUGIFY)
+        pr.reply("def slugify(title):\n    return title.lower()\n")
+        pr.reply(GOOD_SLUGIFY)
+        p = pr.run(["run", "steps", "--samples", "3"])
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        cmds = [r["cmd"] for r in pr.responds()]
+        self.assertEqual(["--greedy" in c for c in cmds], [True, False, False])
+        self.assertNotIn("Your previous implementation", pr.responds()[2]["stdin"], "a sample uses the first prompt")
+        self.assertEqual(pr.read("util.py"), GOOD_SLUGIFY)
+
+    def test_identical_sample_is_not_retested(self):
+        pr = Project()
+        pr.step("01-x", test="python3 -c \"open('runs','a').write('x'); raise SystemExit(1)\"")
+        pr.reply("x = 1\n")
+        pr.reply("x = 1\n")
+        pr.reply("x = 2\n")
+        p = pr.run(["run", "steps", "--samples", "2"])
+        self.assertEqual(p.returncode, 1)
+        self.assertEqual(pr.read("runs"), "xx", "the identical sample is skipped, the retry is tested")
+        self.assertIn("attempt 2 produced identical code", p.stdout)
+
+    def test_default_is_one_sample(self):
+        pr = Project()
+        pr.write("test_util.py", SLUGIFY_TESTS)
+        pr.step("01-slugify")
+        pr.reply(BAD_SLUGIFY)
+        pr.reply(GOOD_SLUGIFY)
+        pr.run(["run", "steps"])
+        self.assertEqual(len(pr.responds()), 2)
+        self.assertIn("Your previous implementation", pr.responds()[1]["stdin"])
+
+    def test_bad_samples_is_usage(self):
+        pr = Project()
+        pr.step("01-a")
+        p = pr.run(["run", "steps", "--samples", "0"])
+        self.assertEqual(p.returncode, 2)
+        self.assertIn("--samples must be at least 1", p.stderr)
+
+
 class SignalTests(unittest.TestCase):
     def test_sigterm_kills_child(self):
         pr = Project()
