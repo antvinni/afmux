@@ -263,12 +263,17 @@ What the model cannot borrow: MinionS gains up to 7 points from sampling each
 job many times; `fm` is nearly deterministic and has no temperature flag.
 
 Measured 2026-10-22 on a 1,060-line, 23.5k-token documentation page with
-five questions, Opus headless, two runs per arm: without afmux the agent
-ran `cat -n` (truncated by Claude Code at 30k characters) and grepped,
-$0.177 and $0.256; with `afm read` $0.219 and $0.161. All answers correct in
-all four runs. Wall time 7x longer with afm. Precision is low (a third to
-two thirds of chunks "match" a question only two chunks answer), recall is
-the thing to protect.
+five questions, Opus headless, five runs per arm (two at 1500-token chunks,
+three at 600): without afmux the agent ran `cat -n` (truncated by Claude Code
+at 30k characters) and grepped, mean $0.198 (0.177 to 0.256); with
+`afm read`, mean $0.205 (0.161 to 0.219), and in every run it grepped
+afterwards for exact line numbers. All five answers correct in all ten runs.
+Wall time 7 to 17x longer with afm (five questions at 50 to 100 s each).
+So read mode is a wash on tokens against an agent that already greps, and
+costs minutes; its value is that the file's text never enters the agent's
+context, not cost. Precision is low (a third to two thirds of chunks "match"
+a question only two chunks answer); recall is the thing to protect, which is
+why the default chunk is 600 tokens.
 
 ## Non-goals
 
