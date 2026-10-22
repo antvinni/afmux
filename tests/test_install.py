@@ -82,6 +82,32 @@ class InstallTests(unittest.TestCase):
         self.assertFalse(os.path.exists(os.path.join(self.home, ".codex")))
         self.assertTrue(os.path.islink(os.path.join(self.home, ".claude", "skills", "afmux")))
 
+    def test_piped_script_clones_even_when_cwd_is_a_checkout(self):
+        e = dict(os.environ)
+        e["HOME"] = self.home
+        e["PATH"] = FAKEFM + os.pathsep + "/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin"
+        e["AFMUX_REPO"] = ROOT
+        e.pop("AFMUX_DIR", None)
+        with open(INSTALL) as script:
+            p = subprocess.run(["bash"], stdin=script, capture_output=True, text=True, env=e, cwd=ROOT, timeout=120)
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertIn("cloned afmux into", p.stdout)
+        afm = os.path.join(self.home, ".local", "bin", "afm")
+        self.assertEqual(os.path.realpath(afm), os.path.realpath(os.path.join(self.home, ".afmux", "scripts", "afm")))
+
+    def test_run_from_a_checkout_file_uses_that_checkout(self):
+        e = dict(os.environ)
+        e["HOME"] = self.home
+        e["PATH"] = FAKEFM + os.pathsep + "/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin"
+        e.pop("AFMUX_DIR", None)
+        p = subprocess.run(["bash", INSTALL], capture_output=True, text=True, env=e, cwd=self.home,
+                           stdin=subprocess.DEVNULL, timeout=120)
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertIn("using checkout at", p.stdout)
+        afm = os.path.join(self.home, ".local", "bin", "afm")
+        self.assertEqual(os.path.realpath(afm), os.path.realpath(os.path.join(ROOT, "scripts", "afm")))
+        self.assertFalse(os.path.exists(os.path.join(self.home, ".afmux")))
+
     def test_model_unavailable_fails_clearly(self):
         p = run_install(self.home, extra_env={"FAKEFM_AVAILABLE_EXIT": "1"})
         self.assertNotEqual(p.returncode, 0)

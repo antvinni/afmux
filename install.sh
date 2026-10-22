@@ -26,7 +26,10 @@ if ! fm available >/dev/null 2>&1 </dev/null; then
 fi
 
 # 2. Checkout: use the directory this script lives in if it is a checkout, else clone or update
-here="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || true)"
+here=""
+if [ -n "${BASH_SOURCE[0]:-}" ] && [ -f "${BASH_SOURCE[0]}" ]; then   # run from a file, not piped via stdin
+  here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+fi
 if [ -n "$here" ] && [ -x "$here/scripts/afm" ] && [ -z "${AFMUX_DIR:-}" ]; then
   dir="$here"
   say "using checkout at $dir"
