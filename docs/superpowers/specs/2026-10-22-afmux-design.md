@@ -391,13 +391,20 @@ enabled, and the Xcode Command Line Tools (for `/usr/bin/python3` and `git`).
 2. Symlink `scripts/afm` to `~/.local/bin/afm`, and make sure `~/.local/bin`
    is on `PATH`. SKILL.md then invokes plain `afm`, which sidesteps the
    question of how each agent passes the skill's directory to the shell.
-3. Symlink the checkout into each agent's skills directory:
-   - Claude Code: `~/.claude/skills/afmux`
-   - Codex: `~/.codex/skills/afmux`, to be confirmed against the current
-     Codex docs while writing the README
-   - OpenCode: `~/.config/opencode/skills/afmux`
+3. Symlink the checkout into the agents' skills directories. Verified
+   against each agent's docs on 2026-10-22: Claude Code reads
+   `~/.claude/skills/`, Codex reads `~/.agents/skills/`, and OpenCode reads
+   `~/.config/opencode/skills/` plus both of the others. Two symlinks,
+   `~/.claude/skills/afmux` and `~/.agents/skills/afmux`, cover all three.
 4. Let `afm` run outside the agent's sandbox. The README gives the setting
-   for each agent and links its sandbox documentation.
+   for each agent and links its sandbox documentation. Verified 2026-10-22:
+   Claude Code's `sandbox.excludedCommands` only applies when every command
+   in the call matches and there is no redirect or command substitution, so
+   a pipe into `afm` or a `< file` redirect stays sandboxed even with
+   `afm *` excluded; the agent then gets exit 5 and must retry the call
+   unsandboxed. Codex has no per-command exclusion, only session-wide
+   `--sandbox danger-full-access` or an approved escalation. OpenCode gates
+   commands with permission rules, not an OS sandbox.
 5. Add the standing rule from the Triggering section to CLAUDE.md or
    AGENTS.md.
 6. Optional, Claude Code only: install the PostToolUse nudge hook from the
