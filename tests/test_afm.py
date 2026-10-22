@@ -541,6 +541,86 @@ class ReportDetailTests(unittest.TestCase):
         self.assertIn("did not exist before", p.stdout)
 
 
+class RegressionTests(unittest.TestCase):
+    def test_step_that_breaks_an_earlier_step_fails_with_regression(self):
+        pr = Project()
+        pr.write("test_util.py", SLUGIFY_TESTS)
+        pr.step("01-slugify")
+        pr.step("02-other", file="util.py", test="python3 -c \"import util; assert util.X == 1\"")
+        pr.reply(GOOD_SLUGIFY)
+        pr.reply("X = 1\n")                      # passes its own test but drops slugify
+        pr.reply("X = 1\n")                      # identical retry
+        p = pr.run(["run", "steps"])
+        self.assertEqual(p.returncode, 1, p.stdout + p.stderr)
+        self.assertIn("regression", p.stdout)
+        self.assertIn("01-slugify", p.stdout)
+        self.assertEqual(pr.read("util.py"), GOOD_SLUGIFY, "the breaking rewrite must be rolled back")
+
+    def test_regression_is_retried_with_the_reason(self):
+        pr = Project()
+        pr.write("test_util.py", SLUGIFY_TESTS)
+        pr.step("01-slugify")
+        pr.step("02-other", file="util.py", test="python3 -c \"import util; assert util.X == 1\"")
+        pr.reply(GOOD_SLUGIFY)
+        pr.reply("X = 1\n")
+        pr.reply(GOOD_SLUGIFY + "X = 1\n")
+        p = pr.run(["run", "steps"])
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertIn("regression", pr.responds()[2]["stdin"])
+        self.assertIn("slugify", pr.responds()[2]["stdin"].split("regression", 1)[1])
+
+
+class RetryQualityTests(unittest.TestCase):
+    def test_identical_retry_is_not_retested(self):
+        pr = Project()
+        pr.step("01-x", test="python3 -c \"open('runs','a').write('x'); raise SystemExit(1)\"")
+        pr.reply("x = 1\n")
+        pr.reply("x = 1\n")
+        p = pr.run(["run", "steps"])
+        self.assertEqual(p.returncode, 1)
+        self.assertEqual(pr.read("runs"), "x", "the identical retry must not run the tests again")
+        self.assertIn("identical", p.stdout)
+
+    def test_notes_include_the_exception_line(self):
+        pr = Project()
+        pr.write("test_util.py", SLUGIFY_TESTS)
+        pr.step("01-slugify")
+        pr.reply(BAD_SLUGIFY)
+        pr.reply(GOOD_SLUGIFY)
+        p = pr.run(["run", "steps"])
+        self.assertIn("AssertionError", p.stdout)
+        self.assertIn("test_basic", p.stdout)
+
+    def test_failure_report_lists_every_attempt(self):
+        pr = Project()
+        pr.write("test_util.py", SLUGIFY_TESTS)
+        pr.step("01-slugify")
+        pr.reply(BAD_SLUGIFY)
+        pr.reply("def slugify(title):\n    return title.lower()\n")
+        p = pr.run(["run", "steps"])
+        self.assertEqual(p.returncode, 1)
+        self.assertIn("attempt 1 failed", p.stdout)
+        self.assertIn("attempt 2 failed", p.stdout)
+
+    def test_duplicate_top_level_definition_is_flagged(self):
+        pr = Project()
+        pr.write("test_util.py", SLUGIFY_TESTS)
+        pr.step("01-slugify")
+        pr.reply("def slugify(t):\n    return 'x'\n\n" + GOOD_SLUGIFY)
+        p = pr.run(["run", "steps"])
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertIn("duplicate", p.stdout)
+        self.assertIn("slugify", p.stdout)
+
+    def test_text_report_has_seconds(self):
+        pr = Project()
+        pr.write("test_util.py", SLUGIFY_TESTS)
+        pr.step("01-slugify")
+        pr.reply(GOOD_SLUGIFY)
+        p = pr.run(["run", "steps"])
+        self.assertIn("seconds", p.stdout.splitlines()[0])
+
+
 class SignalTests(unittest.TestCase):
     def test_sigterm_kills_child(self):
         pr = Project()

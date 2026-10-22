@@ -223,15 +223,28 @@ def write_file(path, content):
 
 
 def failure_summary(output):
-    """One line that says why a test run failed: the first failing test, else the last error line."""
+    """One line that says why a test run failed: the first failing test and the exception line."""
     lines = [ln.strip() for ln in (output or "").splitlines() if ln.strip()]
+    test = exc = None
     for ln in lines:
-        if re.match(r"^(FAIL|ERROR): ", ln):
-            return ln[:160]
+        if test is None and re.match(r"^(FAIL|ERROR): ", ln):
+            test = ln
+        if re.match(r"^[A-Za-z_.]*(Error|Exception|Warning)\b", ln) and not ln.startswith("Traceback"):
+            exc = ln
+            if test is not None:
+                break
+    parts = [x for x in (test, exc) if x]
+    if parts:
+        return " | ".join(parts)[:240]
     for ln in reversed(lines):
         if "Error" in ln or ln.startswith("Traceback"):
-            return ln[:160]
-    return lines[-1][:160] if lines else "no output"
+            return ln[:240]
+    return lines[-1][:240] if lines else "no output"
+
+
+def duplicate_definitions(code):
+    names = re.findall(r"^(?:def|class) ([A-Za-z_]\w*)", code, re.M)
+    return sorted({n for n in names if names.count(n) > 1})
 
 
 def clear_failed(step):
@@ -242,8 +255,12 @@ def clear_failed(step):
             pass
 
 
-def run_step(step, args):
-    """Returns (result, attempts, seconds, notes, failure) where failure is None or a dict."""
+def run_step(step, args, earlier=()):
+    """Returns (result, attempts, seconds, notes, failure) where failure is None or a dict.
+
+    earlier: steps that passed before this one in the run; their tests are rerun after this
+    step passes its own, so a whole-file rewrite cannot silently break them.
+    """
     t0 = time.time()
     existed = os.path.isfile(step.file)
     original = read_file(step.file) if existed else None
@@ -265,7 +282,7 @@ def run_step(step, args):
             raise AfmError(EXIT_BUDGET, "step %s: prompt is %d tokens, budget is %d; split the step or trim its context"
                            % (step.id, used, args.budget))
         try:
-            code = generate(instructions, prompt, args.timeout)
+            new_code = generate(instructions, prompt, args.timeout)
         except AfmError as e:
             if e.code != EXIT_FAIL:
                 raise
@@ -273,11 +290,28 @@ def run_step(step, args):
             previous = code or "(no code produced)"
             notes.append("attempt %d failed: %s" % (attempts, e.message[:160]))
             continue
+        if previous is not None and new_code == previous:
+            notes.append("attempt %d produced identical code; not retested" % attempts)
+            break
+        code = new_code
         write_file(step.file, code)
         ok, output = run_tests(step.test)
         if ok:
-            clear_failed(step)
-            return "pass", attempts, time.time() - t0, notes, None
+            broken = None
+            for e in earlier:
+                eok, eout = run_tests(e.test)
+                if not eok:
+                    broken = (e, eout)
+                    break
+            if broken is None:
+                clear_failed(step)
+                dups = duplicate_definitions(code) if step.file.endswith(".py") else []
+                if dups:
+                    notes.append("warning: duplicate top-level definition of %s; the last one wins" % ", ".join(dups))
+                return "pass", attempts, time.time() - t0, notes, None
+            e, eout = broken
+            output = ("regression: this step's rewrite of %s broke step %s (test: %s). Keep every existing "
+                      "function unchanged.\n\n%s" % (step.file, e.id, e.test, eout))
         notes.append("attempt %d failed: %s" % (attempts, failure_summary(output)))
         previous = code
     saved = step.file + ".afm-failed"
@@ -308,15 +342,16 @@ def head_tail(text, head=25, tail=25):
 def report_text(rows, failed):
     w_id = max(len("step"), max(len(r["id"]) for r in rows))
     w_file = max(len("file"), max(len(r["file"]) for r in rows))
-    lines = ["%-*s  %-*s  %-7s  %s" % (w_id, "step", w_file, "file", "result", "attempts")]
+    lines = ["%-*s  %-*s  %-7s  %-8s  %s" % (w_id, "step", w_file, "file", "result", "attempts", "seconds")]
     for r in rows:
         extra = "  (%s)" % r["notes"][0] if r["attempts"] == 0 and r["notes"] else ""
-        lines.append("%-*s  %-*s  %-7s  %s%s" % (w_id, r["id"], w_file, r["file"], r["result"],
-                                                 r["attempts"] if r["result"] != "skipped" else "-", extra))
-    retried = [r for r in rows if r["result"] == "pass" and r["attempts"] > 1]
-    if retried:
+        att = r["attempts"] if r["result"] != "skipped" else "-"
+        secs = ("%.1f" % r["seconds"]) if r["result"] != "skipped" else "-"
+        lines.append("%-*s  %-*s  %-7s  %-8s  %s%s" % (w_id, r["id"], w_file, r["file"], r["result"], att, secs, extra))
+    noted = [r for r in rows if r["notes"] and r["attempts"] > 0]
+    if noted:
         lines.append("")
-        for r in retried:
+        for r in noted:
             for n in r["notes"]:
                 lines.append("%s: %s" % (r["id"], n))
     if failed:
@@ -407,11 +442,14 @@ def main(argv):
             check_context(steps)
         rows = []
         failed = None
+        passed = []
         for step in steps:
             if failed:
                 rows.append({"id": step.id, "file": step.file, "result": "skipped", "attempts": 0, "seconds": 0, "notes": []})
                 continue
-            result, attempts, seconds, notes, failure = run_step(step, args)
+            result, attempts, seconds, notes, failure = run_step(step, args, earlier=passed)
+            if result == "pass":
+                passed.append(step)
             rows.append({"id": step.id, "file": step.file, "result": result, "attempts": attempts, "seconds": round(seconds, 1), "notes": notes})
             if failure:
                 failure["attempts"] = attempts

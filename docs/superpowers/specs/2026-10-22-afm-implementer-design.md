@@ -67,6 +67,18 @@ afmux/
   README.md, LICENSE
 ```
 
+## Step size
+
+One step per module is the default when the module fits the budget: the
+spec for a whole small module, one test file, one model call, one report
+row. Split into one-function steps only when a module's prompt would exceed
+about 4k tokens or when a function keeps failing on its own. Field tests with
+one-function steps cost 20 to 26 percent more tokens than hand-writing the
+code, most of it in the agent's extra tool calls (6 to 9 against 2 to 3), so
+the skill tells the agent to write all tests and step files in one tool call
+and to let `afm` run the regression checks instead of running the suite
+itself.
+
 ## Step files
 
 A step is one markdown file. A run is a directory of step files, executed in
@@ -131,6 +143,13 @@ afm step <step-file> [options]    run one step
 6. On failure with retries left: new prompt = spec + "Your previous
    implementation:" + code + "It failed these tests; output the complete
    corrected file:" + last 1800 characters of test output. Go to 3.
+6b. After a step's own test passes, rerun the tests of every step that
+   passed earlier in this run. If one fails, treat it as a failed attempt of
+   this step with the output prefixed `regression: this step's rewrite of
+   <file> broke step <id>`, so the retry prompt tells the model what to keep.
+   A retry that produces byte-identical code is noted and not retested.
+   A passing `.py` file with a top-level name defined twice gets a warning
+   note; the last definition wins and tests cannot see the dead one.
 7. On final failure: restore the file's original content (or delete it if
    the step created it, reported as `removed (did not exist before)`), save
    the last attempt beside it as `<file>.afm-failed` and the full test output
@@ -161,6 +180,10 @@ test: python3 -m unittest tests.test_log
 <first 25 and last 25 lines of test output, with an omission marker between>
 attempt saved at src/log.py.afm-failed, test output at src/log.py.afm-failed.log; src/log.py restored
 ```
+
+The text table has a seconds column. Every failed attempt is recorded as a
+note `attempt N failed: <first FAIL/ERROR line> | <exception line>` and the
+report prints the notes of every step that generated code, passed or failed.
 
 `--json`: `{"steps": [{"id", "file", "result", "attempts", "seconds", "notes"}],
 "failed": {"id", "test", "output", "saved", "log"} | null}`.
