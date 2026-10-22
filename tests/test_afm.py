@@ -398,5 +398,25 @@ class ChunkTests(unittest.TestCase):
         self.assertEqual(p.returncode, 6)
 
 
+def real_model_works():
+    env = dict(os.environ)
+    try:
+        if subprocess.run(["fm", "available"], capture_output=True, env=env).returncode != 0:
+            return False
+        return subprocess.run(["fm", "respond", "--no-stream", "hi"], capture_output=True, env=env,
+                              timeout=60).returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
+@unittest.skipUnless(real_model_works(), "on-device model not usable here")
+class IntegrationTests(unittest.TestCase):
+    def test_classify_real(self):
+        p = subprocess.run([AFM, "classify", "--labels", "positive,negative"], input="I absolutely loved this film.",
+                           capture_output=True, text=True)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertIn(json.loads(p.stdout)["label"], ("positive", "negative"))
+
+
 if __name__ == "__main__":
     unittest.main()
