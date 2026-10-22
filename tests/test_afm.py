@@ -655,6 +655,40 @@ class HeaderAndSummaryTests(unittest.TestCase):
         self.assertIn("0 warnings", last)
 
 
+class Round4Tests(unittest.TestCase):
+    def test_already_passing_step_counts_its_tests(self):
+        pr = Project()
+        pr.write("test_util.py", SLUGIFY_TESTS)
+        pr.write("util.py", GOOD_SLUGIFY)
+        pr.step("01-slugify")
+        p = pr.run(["run", "steps"])
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertIn("2 tests", p.stdout.strip().splitlines()[-1])
+        self.assertIn("0 warnings", p.stdout)
+        self.assertNotIn("warning:", p.stdout)
+
+    def test_existing_failing_file_is_reported_before_regenerating(self):
+        pr = Project()
+        pr.write("test_util.py", SLUGIFY_TESTS)
+        pr.write("util.py", BAD_SLUGIFY)
+        pr.step("01-slugify")
+        pr.reply(GOOD_SLUGIFY)
+        p = pr.run(["run", "steps"])
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertIn("existing util.py failed its test", p.stdout)
+
+    def test_retries_sample_instead_of_repeating(self):
+        pr = Project()
+        pr.write("test_util.py", SLUGIFY_TESTS)
+        pr.step("01-slugify")
+        pr.reply(BAD_SLUGIFY)
+        pr.reply(GOOD_SLUGIFY)
+        pr.run(["run", "steps"])
+        first, second = pr.responds()[0]["cmd"], pr.responds()[1]["cmd"]
+        self.assertIn("--greedy", first)
+        self.assertNotIn("--greedy", second)
+
+
 class SignalTests(unittest.TestCase):
     def test_sigterm_kills_child(self):
         pr = Project()

@@ -28,7 +28,9 @@ slugify(s): lowercase, each run of characters other than a-z and 0-9 becomes one
 Examples: slugify("Hello, World!") == "hello-world"; slugify("!!!") == "".
 ```
 
-A spec is plain English: one or two sentences per function with the signature, the rule, the edge cases, and one or two examples. No numbered steps, no pseudocode, no algorithm. Say exactly what is ambiguous (character classes, padding, tie-breaks, the empty case) and nothing else. Library calls you care about go in as literal lines.
+A spec is plain English: one or two sentences per function with the signature, the rule, the edge cases, and one or two examples. No numbered steps, no pseudocode, no algorithm. Say exactly what is ambiguous (character classes, padding, tie-breaks, the empty case) and nothing else. Library calls you care about go in as literal lines (`parser.add_argument("file")`): the model invents API names otherwise.
+
+Measured on five small modules from prose specs: the model got 3 of 8 right, all of them trivial (a CSV loader, a filter, a summary). It failed parsing with positional fields, calendar arithmetic, argparse wiring and anything with an off-by-one trap, and a retry almost never changes its output. Expect to write those yourself.
 
 ### Run
 
@@ -46,7 +48,7 @@ After a step passes, `afm` reruns every earlier step's tests, so a rewrite that 
 | Exit | Meaning | Do |
 | :--- | :--- | :--- |
 | 0 | every step passed | done; check the summary line's warnings |
-| 1 | a step failed after its retry, or the model errored | do not rewrite the spec; implement that one file yourself from your tests, delete `<file>.afm-failed` and `.afm-failed.log`, and rerun `afm run` so the remaining steps continue |
+| 1 | a step failed after its retry, or the model errored | do not rewrite the spec; implement that one file yourself from your tests (`<file>.afm-failed` may have usable parts), make sure your file passes its test, and rerun `afm run` so the remaining steps continue; a hand-written file that fails its test is regenerated over |
 | 2 | bad step file or arguments | fix it |
 | 4 | `fm` missing or model unavailable | implement the steps yourself |
 | 5 | blocked by the sandbox | rerun outside it (Claude Code: `dangerouslyDisableSandbox: true`, or `afm *` in `excludedCommands`) |

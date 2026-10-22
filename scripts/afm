@@ -152,9 +152,14 @@ def count_tokens(text, instructions=""):
         raise AfmError(EXIT_FAIL, "fm count-tokens returned %r" % out.strip())
 
 
-def generate(instructions, prompt, timeout):
-    """One model call. Returns the code, or raises AfmError(EXIT_FAIL) with fm's message."""
-    code, out, err = run_fm(["respond", "--no-stream", "--greedy", "--instructions=" + instructions], prompt, timeout=timeout)
+def generate(instructions, prompt, timeout, greedy=True):
+    """One model call. Returns the code, or raises AfmError(EXIT_FAIL) with fm's message.
+
+    The first attempt is greedy (deterministic). Retries sample, otherwise a retry with the
+    same prompt context tends to reproduce the same code byte for byte.
+    """
+    args = ["respond", "--no-stream"] + (["--greedy"] if greedy else []) + ["--instructions=" + instructions]
+    code, out, err = run_fm(args, prompt, timeout=timeout)
     if code != 0:
         acode, _, aerr = run_fm(["available"], "")
         if acode != 0:
@@ -277,18 +282,21 @@ def run_step(step, args, earlier=()):
     t0 = time.time()
     existed = os.path.isfile(step.file)
     original = read_file(step.file) if existed else None
+    notes = []
     if existed:
         ok, out0 = run_tests(step.test)
+        n0 = tests_run(out0)
         if ok:
             clear_failed(step)
-            notes = ["already passing, not regenerated"]
-            if tests_run(out0) == 0:
+            notes.append("already passing, not regenerated")
+            if n0 == 0:
                 notes.append("warning: the test command ran 0 tests")
+            notes.append("tests run: %s" % ("unknown" if n0 is None else n0))
             return "pass", 0, time.time() - t0, notes, None
+        notes.append("existing %s failed its test; regenerating it (it is restored if every attempt fails)" % step.file)
     instructions = INSTRUCTIONS % step.file
     previous = output = None
     attempts = 0
-    notes = []
     code = ""
     while attempts <= args.retries:
         attempts += 1
@@ -298,7 +306,7 @@ def run_step(step, args, earlier=()):
             raise AfmError(EXIT_BUDGET, "step %s: prompt is %d tokens, budget is %d; split the step or trim its context"
                            % (step.id, used, args.budget))
         try:
-            new_code = generate(instructions, prompt, args.timeout)
+            new_code = generate(instructions, prompt, args.timeout, greedy=(attempts == 1))
         except AfmError as e:
             if e.code != EXIT_FAIL:
                 raise
