@@ -85,7 +85,7 @@ Write a Python function `parse_date(s)` ...
 |---|---|---|
 | `file` | yes | the one file this step creates or rewrites, relative to the directory `afm` runs in |
 | `test` | yes | shell command run from the same directory; exit 0 means the step passed |
-| `context` | no | comma-separated files shown to the model as read-only reference (interfaces from earlier steps) |
+| `context` | no | comma-separated files shown to the model as read-only reference (interfaces from earlier steps). Must exist when the run starts or be the `file` of an earlier step in the same run |
 
 The body is the spec. SKILL.md says what a good one contains. A step with
 no `file` or no `test` is a usage error: an untested step cannot be reported
@@ -107,6 +107,10 @@ afm step <step-file> [options]    run one step
 
 ## Behaviour of one step
 
+0. If `file` exists and `test` already passes against it, report `pass` with
+   0 attempts and the note `already passing, not regenerated`, and remove any
+   stale `<file>.afm-failed` files. This is how reruns skip finished steps and
+   how a step the agent implemented by hand is left alone.
 1. Parse the step file (usage error on a bad header). Read the current
    content of `file` if it exists, and each `context` file.
 2. Build the prompt: fixed instructions ("you are implementing one step;
@@ -128,8 +132,15 @@ afm step <step-file> [options]    run one step
    implementation:" + code + "It failed these tests; output the complete
    corrected file:" + last 1800 characters of test output. Go to 3.
 7. On final failure: restore the file's original content (or delete it if
-   the step created it), save the last attempt beside it as
-   `<file>.afm-failed`, and stop the run.
+   the step created it, reported as `removed (did not exist before)`), save
+   the last attempt beside it as `<file>.afm-failed` and the full test output
+   as `<file>.afm-failed.log`, and stop the run.
+
+Writing a `.py` file also deletes its stale `__pycache__` bytecode: a same-size
+rewrite within one second would otherwise be ignored by Python's import cache
+and the test would judge the previous attempt. Every attempt that fails
+records a one-line reason (the first `FAIL:`/`ERROR:` line of the test output)
+that the report shows even when a later attempt passed.
 
 Tests are never shown to the model unless the agent puts them in the spec.
 
@@ -143,14 +154,16 @@ step            file          result  attempts
 02-slugify      src/util.py   pass    2
 03-log-line     src/log.py    FAIL    2
 
+02-slugify: attempt 1 failed: FAIL: test_underscore (tests.test_util.SlugifyTests.test_underscore)
+
 step 03-log-line failed after 2 attempts
 test: python3 -m unittest tests.test_log
-<last 60 lines of test output>
-attempt saved at src/log.py.afm-failed; src/log.py restored
+<first 25 and last 25 lines of test output, with an omission marker between>
+attempt saved at src/log.py.afm-failed, test output at src/log.py.afm-failed.log; src/log.py restored
 ```
 
-`--json`: `{"steps": [{"id", "file", "result", "attempts", "seconds"}],
-"failed": {"id", "test", "output", "saved"} | null}`.
+`--json`: `{"steps": [{"id", "file", "result", "attempts", "seconds", "notes"}],
+"failed": {"id", "test", "output", "saved", "log"} | null}`.
 
 Exit codes: 0 all steps passed; 1 a step failed its tests after retries, or
 `fm` failed on it; 2 usage (bad step file, missing directory, no steps);
@@ -159,15 +172,20 @@ Nothing but the report goes to stdout.
 
 ## SKILL.md
 
-Under about 80 lines. Frontmatter description written for the moment an
+Under about 60 lines. Frontmatter description written for the moment an
 agent has a task it could hand off:
 
 > Implement small, well-specified steps on the free on-device Apple
-> Foundation Model so the code is written locally and never leaves the
-> machine. You break the task into one-function or one-edit steps, each with
-> a tight spec and a test command; `afm run` executes them, tests each, and
-> reports once. Use for mechanical implementation work where tests can judge
-> the result; expect about half the steps to come back to you. macOS only.
+> Foundation Model. You break the task into one-function or one-edit steps,
+> each with a tight spec and a test command; `afm run` executes them, tests
+> each, retries once, and reports once. Use for mechanical implementation
+> work where tests can judge the result; expect about half the steps to need
+> a spec fix or your own code, and more tokens than writing it yourself.
+> macOS only.
+
+Field test 2026-10-22, five Opus agents building modules with afmux against
+five writing them by hand: +26% tokens and 7x wall time with afmux, same test
+results; 15 of 24 steps passed first try. The description says so.
 
 Body: how to break work down (one function or one edit per step; spec =
 signature, behaviour, examples, edge cases, interfaces it depends on; tests

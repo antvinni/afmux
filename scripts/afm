@@ -23,7 +23,7 @@ DEFAULT_BUDGET = 7168
 DEFAULT_TIMEOUT = 120
 DEFAULT_RETRIES = 1
 TEST_TIMEOUT = 120
-USAGE = "usage: afm run <steps-dir> [--retries N] [--timeout S] [--budget T] [--json] | afm step <step-file> [options]"
+USAGE = "afm run <steps-dir> [--retries N] [--timeout S] [--budget T] [--json] | afm step <step-file> [options]"
 HANDLED_SIGNALS = (signal.SIGTERM, signal.SIGINT, signal.SIGHUP)
 HEADER_KEYS = ("file", "test", "context")
 _ANSI = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
@@ -80,10 +80,17 @@ def parse_step(path):
     if not spec:
         raise AfmError(EXIT_USAGE, "step %s: the spec after '---' is empty" % step_id)
     context = [c.strip() for c in fields.get("context", "").split(",") if c.strip()]
-    for c in context:
-        if not os.path.isfile(c):
-            raise AfmError(EXIT_USAGE, "step %s: context file not found: %s" % (step_id, c))
     return Step(step_id, path, fields["file"], fields["test"], context, spec)
+
+
+def check_context(steps):
+    """Every context file must exist now or be the file an earlier step writes."""
+    produced = set()
+    for step in steps:
+        for c in step.context:
+            if not os.path.isfile(c) and c not in produced:
+                raise AfmError(EXIT_USAGE, "step %s: context file not found: %s (it is not written by an earlier step either)" % (step.id, c))
+        produced.add(step.file)
 
 
 def load_steps(directory):
@@ -92,7 +99,9 @@ def load_steps(directory):
     names = sorted(n for n in os.listdir(directory) if n.endswith(".md"))
     if not names:
         raise AfmError(EXIT_USAGE, "no step files (*.md) in %s" % directory)
-    return [parse_step(os.path.join(directory, n)) for n in names]
+    steps = [parse_step(os.path.join(directory, n)) for n in names]
+    check_context(steps)
+    return steps
 
 
 # --- running fm ---------------------------------------------------------------
@@ -175,6 +184,8 @@ def build_prompt(step, current, previous=None, test_output=None):
     if current is not None:
         parts.append("Current contents of %s. Output the complete modified file:\n\n%s" % (step.file, current))
     for path in step.context:
+        if not os.path.isfile(path):
+            raise AfmError(EXIT_USAGE, "step %s: context file not found: %s" % (step.id, path))
         parts.append("Reference only, do not modify: %s\n\n%s" % (path, read_file(path)))
     if previous is not None:
         parts.append("Your previous implementation:\n\n%s" % previous)
@@ -198,16 +209,53 @@ def write_file(path, content):
         os.makedirs(d, exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
         f.write(content)
+    if path.endswith(".py"):
+        # a same-size rewrite within one second would otherwise load stale bytecode
+        cache = os.path.join(d or ".", "__pycache__")
+        stem = os.path.splitext(os.path.basename(path))[0] + "."
+        if os.path.isdir(cache):
+            for name in os.listdir(cache):
+                if name.startswith(stem) and name.endswith(".pyc"):
+                    try:
+                        os.unlink(os.path.join(cache, name))
+                    except OSError:
+                        pass
+
+
+def failure_summary(output):
+    """One line that says why a test run failed: the first failing test, else the last error line."""
+    lines = [ln.strip() for ln in (output or "").splitlines() if ln.strip()]
+    for ln in lines:
+        if re.match(r"^(FAIL|ERROR): ", ln):
+            return ln[:160]
+    for ln in reversed(lines):
+        if "Error" in ln or ln.startswith("Traceback"):
+            return ln[:160]
+    return lines[-1][:160] if lines else "no output"
+
+
+def clear_failed(step):
+    for suffix in (".afm-failed", ".afm-failed.log"):
+        try:
+            os.unlink(step.file + suffix)
+        except OSError:
+            pass
 
 
 def run_step(step, args):
-    """Returns (result, attempts, seconds, failure) where failure is None or a dict."""
+    """Returns (result, attempts, seconds, notes, failure) where failure is None or a dict."""
     t0 = time.time()
     existed = os.path.isfile(step.file)
     original = read_file(step.file) if existed else None
+    if existed:
+        ok, _ = run_tests(step.test)
+        if ok:
+            clear_failed(step)
+            return "pass", 0, time.time() - t0, ["already passing, not regenerated"], None
     instructions = INSTRUCTIONS % step.file
     previous = output = None
     attempts = 0
+    notes = []
     code = ""
     while attempts <= args.retries:
         attempts += 1
@@ -223,15 +271,18 @@ def run_step(step, args):
                 raise
             output = "fm: " + e.message
             previous = code or "(no code produced)"
+            notes.append("attempt %d failed: %s" % (attempts, e.message[:160]))
             continue
         write_file(step.file, code)
         ok, output = run_tests(step.test)
         if ok:
-            return "pass", attempts, time.time() - t0, None
+            clear_failed(step)
+            return "pass", attempts, time.time() - t0, notes, None
+        notes.append("attempt %d failed: %s" % (attempts, failure_summary(output)))
         previous = code
-    # final failure: restore or remove, keep the attempt beside the file
     saved = step.file + ".afm-failed"
     write_file(saved, code if code else "(no code produced)\n")
+    write_file(saved + ".log", "test: %s\n\n%s" % (step.test, output or ""))
     if existed:
         write_file(step.file, original)
         restored = "%s restored" % step.file
@@ -240,30 +291,45 @@ def run_step(step, args):
             os.unlink(step.file)
         except OSError:
             pass
-        restored = "%s removed" % step.file
-    return "FAIL", attempts, time.time() - t0, {"id": step.id, "test": step.test, "output": output or "",
-                                                  "saved": saved, "restored": restored}
+        restored = "%s removed (did not exist before)" % step.file
+    return "FAIL", attempts, time.time() - t0, notes, {"id": step.id, "test": step.test, "output": output or "",
+                                                         "saved": saved, "log": saved + ".log", "restored": restored}
 
 
 # --- reports --------------------------------------------------------------------
+
+def head_tail(text, head=25, tail=25):
+    lines = text.strip().splitlines()
+    if len(lines) <= head + tail:
+        return "\n".join(lines)
+    return "\n".join(lines[:head] + ["... %d lines omitted, full output in the .afm-failed.log file ..." % (len(lines) - head - tail)] + lines[-tail:])
+
 
 def report_text(rows, failed):
     w_id = max(len("step"), max(len(r["id"]) for r in rows))
     w_file = max(len("file"), max(len(r["file"]) for r in rows))
     lines = ["%-*s  %-*s  %-7s  %s" % (w_id, "step", w_file, "file", "result", "attempts")]
     for r in rows:
-        lines.append("%-*s  %-*s  %-7s  %s" % (w_id, r["id"], w_file, r["file"], r["result"], r["attempts"] if r["attempts"] else "-"))
+        extra = "  (%s)" % r["notes"][0] if r["attempts"] == 0 and r["notes"] else ""
+        lines.append("%-*s  %-*s  %-7s  %s%s" % (w_id, r["id"], w_file, r["file"], r["result"],
+                                                 r["attempts"] if r["result"] != "skipped" else "-", extra))
+    retried = [r for r in rows if r["result"] == "pass" and r["attempts"] > 1]
+    if retried:
+        lines.append("")
+        for r in retried:
+            for n in r["notes"]:
+                lines.append("%s: %s" % (r["id"], n))
     if failed:
-        tail = "\n".join(failed["output"].strip().splitlines()[-60:])
         lines += ["", "step %s failed after %d attempt%s" % (failed["id"], failed["attempts"], "" if failed["attempts"] == 1 else "s"),
-                  "test: %s" % failed["test"], tail, "attempt saved at %s; %s" % (failed["saved"], failed["restored"])]
+                  "test: %s" % failed["test"], head_tail(failed["output"]),
+                  "attempt saved at %s, test output at %s; %s" % (failed["saved"], failed["log"], failed["restored"])]
     return "\n".join(lines) + "\n"
 
 
 def report_json(rows, failed):
     out = {"steps": rows, "failed": None}
     if failed:
-        out["failed"] = {k: failed[k] for k in ("id", "test", "output", "saved")}
+        out["failed"] = {k: failed[k] for k in ("id", "test", "output", "saved", "log")}
     return json.dumps(out, indent=1) + "\n"
 
 
@@ -288,20 +354,35 @@ def install_signal_handlers():
 
 class _Parser(argparse.ArgumentParser):
     def error(self, message):
-        raise AfmError(EXIT_USAGE, "%s\n%s" % (message, USAGE))
+        raise AfmError(EXIT_USAGE, "%s\nusage: %s" % (message, USAGE))
+
+
+HELP_EPILOG = """step file (steps/01-name.md), header then --- then the spec:
+  file: src/util.py                          the one file this step writes (relative to the current directory)
+  test: python3 -m unittest tests.test_util  run from the current directory; exit 0 means the step passed
+  context: src/types.py, src/errors.py       optional, comma-separated read-only files shown to the model
+  ---
+  Write a Python function ...
+
+A step whose test already passes against the current file is reported as done and not regenerated,
+so reruns skip finished steps and leave hand-written ones alone. On a final failure the original file
+is restored (or a new one removed) and the attempt is kept at <file>.afm-failed with the test output
+at <file>.afm-failed.log. Exit codes: 0 all passed, 1 a step failed, 2 usage, 4 fm unavailable,
+5 sandbox, 6 a step's prompt over budget."""
 
 
 def parse_args(argv):
-    p = _Parser(prog="afm", usage=USAGE)
-    p.add_argument("command", nargs="?", choices=["run", "step"])
-    p.add_argument("target", nargs="?")
-    p.add_argument("--retries", type=int, default=DEFAULT_RETRIES)
-    p.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT)
-    p.add_argument("--budget", type=int, default=DEFAULT_BUDGET)
-    p.add_argument("--json", action="store_true")
+    p = _Parser(prog="afm", usage=USAGE, epilog=HELP_EPILOG, formatter_class=argparse.RawDescriptionHelpFormatter,
+                description="Implement agent-written, test-gated steps on the on-device Apple Foundation Model.")
+    p.add_argument("command", nargs="?", choices=["run", "step"], help="run: every step in a directory in filename order; step: one step file")
+    p.add_argument("target", nargs="?", help="the steps directory (run) or the step file (step)")
+    p.add_argument("--retries", type=int, default=DEFAULT_RETRIES, help="retries per step, each shown the failing test output (default %(default)s)")
+    p.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT, help="seconds per model call (default %(default)s)")
+    p.add_argument("--budget", type=int, default=DEFAULT_BUDGET, help="maximum prompt tokens per call (default %(default)s)")
+    p.add_argument("--json", action="store_true", help="machine-readable report on stdout")
     args = p.parse_args(argv)
     if not args.command or not args.target:
-        raise AfmError(EXIT_USAGE, USAGE)
+        raise AfmError(EXIT_USAGE, "usage: " + USAGE)
     if args.retries < 0:
         raise AfmError(EXIT_USAGE, "--retries must be 0 or more")
     if not (args.timeout > 0) or math.isinf(args.timeout):
@@ -323,14 +404,15 @@ def main(argv):
             if not os.path.isfile(args.target):
                 raise AfmError(EXIT_USAGE, "step file not found: %s" % args.target)
             steps = [parse_step(args.target)]
+            check_context(steps)
         rows = []
         failed = None
         for step in steps:
             if failed:
-                rows.append({"id": step.id, "file": step.file, "result": "skipped", "attempts": 0, "seconds": 0})
+                rows.append({"id": step.id, "file": step.file, "result": "skipped", "attempts": 0, "seconds": 0, "notes": []})
                 continue
-            result, attempts, seconds, failure = run_step(step, args)
-            rows.append({"id": step.id, "file": step.file, "result": result, "attempts": attempts, "seconds": round(seconds, 1)})
+            result, attempts, seconds, notes, failure = run_step(step, args)
+            rows.append({"id": step.id, "file": step.file, "result": result, "attempts": attempts, "seconds": round(seconds, 1), "notes": notes})
             if failure:
                 failure["attempts"] = attempts
                 failed = failure
