@@ -53,6 +53,10 @@ afm run steps/ --retries 0  # no retry; also --timeout S, --budget T
 python3 -m unittest discover tests
 ```
 
+### Measurements
+
+Every mode was benchmarked against the agent working alone; none saved tokens. The data is in [`docs/report-2026-10-22.md`](docs/report-2026-10-22.md).
+
 ### Licence
 
 MIT.
