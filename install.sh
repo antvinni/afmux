@@ -9,7 +9,7 @@ set -euo pipefail
 
 repo="${AFMUX_REPO:-https://github.com/antvinni/afmux}"
 dir="${AFMUX_DIR:-$HOME/.afmux}"
-rule='When you need only a summary, a label, some fields or a commit message from command output or a file, pipe it into `afm` (see the afmux skill) instead of reading it yourself.'
+rule='For mechanical implementation work that tests can judge, break it into small steps with a spec and a test each and run them with `afm run` (see the afmux skill) instead of writing the code yourself.'
 marker='<!-- afmux standing rule -->'
 
 say()  { printf '%s\n' "$*"; }
@@ -135,8 +135,5 @@ fi
 
 # 6. Done
 say ""
-say "afmux is installed. Presets:"
-"$HOME/.local/bin/afm" --list </dev/null
-say ""
-say "Try:  git diff | afm commit-msg"
-say "Claude Code: pipes into afm still run sandboxed; when afm exits 5, let Claude retry the command unsandboxed."
+say "afmux is installed: afm run <steps-dir> implements test-gated steps on the on-device model."
+say "See SKILL.md for how an agent writes steps."
