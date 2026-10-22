@@ -23,7 +23,7 @@ EXIT_OK, EXIT_FAIL, EXIT_USAGE, EXIT_UNAVAILABLE, EXIT_SANDBOX, EXIT_BUDGET = 0,
 DEFAULT_BUDGET = 7168
 DEFAULT_TIMEOUT = 120
 DEFAULT_RETRIES = 1
-DEFAULT_CHUNK_TOKENS = 1500
+DEFAULT_CHUNK_TOKENS = 600
 TEST_TIMEOUT = 120
 USAGE = "afm run <steps-dir> [--retries N] [--timeout S] [--budget T] [--json] | afm step <step-file> [options] | afm read <file> --ask \"question\" [--chunk-tokens N] [--json]"
 HANDLED_SIGNALS = (signal.SIGTERM, signal.SIGINT, signal.SIGHUP)
@@ -465,17 +465,17 @@ def _join(units):
 
 # --- read mode: answer a question about a file, one small chunk at a time ---------------
 
-READ_INSTRUCTIONS = ("You are given one chunk of a longer document and a question. If this chunk contains information that "
-                     "answers the question, set found to true, give a concise answer, and copy into quote a short passage "
-                     "from the chunk, exactly as written, that supports it. If the chunk does not answer the question, set "
-                     "found to false and leave answer and quote empty. Never guess from outside the chunk. Question: %s")
+READ_INSTRUCTIONS = ("You are given one chunk of a longer document and a question. If this chunk contains a passage that "
+                     "answers the question, set found to true and copy that passage into quote exactly as written, one to "
+                     "three sentences. If the chunk does not answer the question, set found to false and leave quote empty. "
+                     "Never write anything that is not in the chunk. Question: %s")
 
 READ_SCHEMA = {
     "title": "Extract",
     "type": "object",
-    "properties": {"found": {"type": "boolean"}, "answer": {"type": "string"}, "quote": {"type": "string"}},
-    "required": ["found", "answer", "quote"],
-    "x-order": ["found", "answer", "quote"],
+    "properties": {"found": {"type": "boolean"}, "quote": {"type": "string"}},
+    "required": ["found", "quote"],
+    "x-order": ["found", "quote"],
     "additionalProperties": False,
 }
 
@@ -535,7 +535,7 @@ def read_file_answers(path, question, args):
         if not quote.strip() or _norm(quote) not in _norm(ctext):
             dropped += 1
             continue
-        answers.append({"lines": "%d-%d" % (first, last), "answer": str(obj.get("answer") or "").strip(), "quote": quote.strip()})
+        answers.append({"lines": "%d-%d" % (first, last), "quote": quote.strip()})
     return {"file": path, "question": question, "chunks": len(chunks), "tokens": total, "dropped": dropped, "answers": answers}
 
 
@@ -544,13 +544,12 @@ def report_read(res, as_json):
         return json.dumps(res, indent=1, ensure_ascii=False) + "\n"
     lines = []
     if res["answers"]:
-        lines.append("%d of %d chunks answered (%d tokens read locally%s)" % (
+        lines.append("%d of %d chunks matched (%d tokens read locally%s)" % (
             len(res["answers"]), res["chunks"], res["tokens"], ", %d dropped: quote not in text" % res["dropped"] if res["dropped"] else ""))
         for a in res["answers"]:
-            lines.append("[lines %s] %s" % (a["lines"], a["answer"]))
-            lines.append("    \"%s\"" % a["quote"])
+            lines.append("[lines %s] \"%s\"" % (a["lines"], a["quote"]))
     else:
-        lines.append("no chunk answered the question (%d chunks, %d tokens read locally%s)" % (
+        lines.append("no chunk matched the question (%d chunks, %d tokens read locally%s)" % (
             res["chunks"], res["tokens"], ", %d dropped: quote not in text" % res["dropped"] if res["dropped"] else ""))
     return "\n".join(lines) + "\n"
 

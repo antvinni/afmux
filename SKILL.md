@@ -1,6 +1,6 @@
 ---
 name: afmux
-description: Implement modules on the free on-device Apple Foundation Model from short plain-English specs. You write the tests and a few sentences per function; `afm run` implements each module locally, tests it, checks it didn't break earlier steps, retries once, and reports once. Steps the model cannot get right from a short spec, you write yourself. macOS only.
+description: Use the free on-device Apple Foundation Model for two jobs. `afm read FILE --ask "question"` answers a question about a long file from verified quotes so you never read the file into context. `afm run steps/` implements modules from your tests and short specs, tests them, and reports once; steps it cannot get right, you write yourself. macOS only.
 ---
 
 # afmux
@@ -42,6 +42,15 @@ afm run steps/ --retries 0  # default 1; also --timeout S (120), --budget T (716
 ```
 
 After a step passes, `afm` reruns every earlier step's tests, so a rewrite that breaks earlier code fails here. A step whose test already passes is reported `pass 0 (already passing)` and not regenerated, so a rerun after you implement a step by hand is safe. The report ends with `N/M steps passed, T tests, R retries, W warnings`; a step whose test command ran 0 tests gets a warning.
+
+### Read a long file without reading it
+
+```
+afm read docs/guide.md --ask "Which setting turns the sandbox off?"   # one question per call
+afm read docs/guide.md --ask "..." --chunk-tokens 1500                 # default 600; bigger chunks are faster but miss more
+```
+
+`afm` splits the file into chunks, asks the model per chunk whether it contains a passage that answers the question, and prints only verified quotes with line ranges (a quote that is not in the file is dropped). You never see the file. Answer from the quotes and cite the lines; expect some irrelevant matches, and read the file only if nothing useful comes back. Borrowed from the MinionS protocol (HazyResearch), where the cloud model never reads the document.
 
 ### Exit codes
 
