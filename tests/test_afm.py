@@ -621,6 +621,40 @@ class RetryQualityTests(unittest.TestCase):
         self.assertIn("seconds", p.stdout.splitlines()[0])
 
 
+class HeaderAndSummaryTests(unittest.TestCase):
+    def test_header_comments_are_stripped(self):
+        pr = Project()
+        pr.write("test_util.py", SLUGIFY_TESTS)
+        pr.write("steps/01-a.md", "file: util.py   # the one file\ntest: python3 -m unittest test_util  # exit 0 = pass\n---\n" + SLUGIFY_SPEC + "\n")
+        pr.reply(GOOD_SLUGIFY)
+        p = pr.run(["run", "steps"])
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertTrue(pr.exists("util.py"))
+        self.assertFalse(pr.exists("util.py   # the one file"))
+
+    def test_zero_tests_run_is_warned(self):
+        pr = Project()
+        # a runner that collects nothing but still exits 0 (older unittest, some pytest configs)
+        pr.step("01-a", test="python3 -c \"print('Ran 0 tests in 0.000s'); print('OK')\"")
+        pr.reply("x = 1\n")
+        p = pr.run(["run", "steps"])
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertIn("0 tests", p.stdout)
+        self.assertIn("warning", p.stdout)
+
+    def test_success_summary_line(self):
+        pr = Project()
+        pr.write("test_util.py", SLUGIFY_TESTS)
+        pr.step("01-slugify")
+        pr.reply(GOOD_SLUGIFY)
+        p = pr.run(["run", "steps"])
+        last = p.stdout.strip().splitlines()[-1]
+        self.assertIn("1/1 steps passed", last)
+        self.assertIn("2 tests", last)
+        self.assertIn("0 retries", last)
+        self.assertIn("0 warnings", last)
+
+
 class SignalTests(unittest.TestCase):
     def test_sigterm_kills_child(self):
         pr = Project()
