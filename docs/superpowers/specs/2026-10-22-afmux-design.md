@@ -64,7 +64,7 @@ afmux/
 Under about 80 lines. Contents, in this order:
 
 1. When to delegate: bounded task, no reasoning or code generation, input
-   under 7000 tokens, answer is text or flat JSON.
+   under about 7000 tokens, answer is text or flat JSON.
 2. When not to: anything needing repo context, multi-step work, or where a
    wrong answer is expensive to detect.
 3. The two command shapes (below), with one example each.
@@ -111,7 +111,10 @@ line.
    to stderr. Never truncate.
 4. Run `fm respond --no-stream --greedy -i <instructions> [--schema FILE]`
    with the input on stdin, under the timeout.
-5. If `fm` exits non-zero, pass its stderr through and exit 1.
+5. If `fm` cannot be executed at all, exit 4. If `fm respond` exits
+   non-zero, run `fm available`; if that fails, exit 4, otherwise pass the
+   `fm respond` stderr through and exit 1. A timeout is exit 1 with
+   `timed out after N s` on stderr.
 6. If a schema was used, parse stdout as JSON. On failure print the raw
    output to stderr and exit 3. For `classify`, additionally check that
    `label` is one of `--labels`; otherwise exit 3.
@@ -169,8 +172,11 @@ sessions, images, OCR, `fm serve`, tool calling.
 Symlink the checkout into each agent's skills directory:
 
 - Claude Code: `~/.claude/skills/afmux`
-- Codex and OpenCode: their user-level skills directories, to be confirmed
-  against current docs when the README is written.
+- Codex: `~/.codex/skills/afmux`
+- OpenCode: `~/.config/opencode/skills/afmux`
+
+The README links each agent's skills documentation next to its path so a
+reader can check the location if an agent moves it.
 
 The script is run by path from inside the skill directory, so nothing goes on
 `PATH`.
