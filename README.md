@@ -1,6 +1,6 @@
 # afmux
 
-afmux turns Apple's free on-device Foundation Model into an implementer for coding agents (Claude Code, Codex, OpenCode). The agent breaks a task into small test-gated steps and writes each step's spec and tests; `afm run` implements each step locally, runs its tests, retries once, and reports back once. The agent reads test results, never passing code, and the code never leaves the machine.
+afmux turns Apple's free on-device Foundation Model into an implementer for coding agents (Claude Code, Codex, OpenCode). The agent breaks a task into small test-gated steps and writes each step's spec and tests; `afm run` implements each step locally, runs its tests, retries once, and reports back once.
 
 ### Features
 
