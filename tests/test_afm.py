@@ -326,5 +326,77 @@ class SchemaTests(unittest.TestCase):
         self.assertEqual(p.stdout, '{"k":true}\n')
 
 
+class ChunkTests(unittest.TestCase):
+    # ask "S." instructions are 2 bytes -> count = ceil((len+2)/4)
+    def test_fits_in_one_piece_still_uses_chunk_format(self):
+        p = run_afm(["ask", "S.", "--chunk"], stdin="hello", env={"FAKEFM_RESPOND_STDOUT": "ans"})
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertEqual(p.stdout, "[1/1]\nans\n")
+
+    def test_splits_at_blank_lines_and_keeps_order(self):
+        tmp = tempfile.mkdtemp()
+        text = "\n\n".join(["A" * 100, "B" * 100, "C" * 100])
+        # each paragraph ~26 tokens; budget 60 -> 2 per piece max
+        p = run_afm(["ask", "S.", "--chunk", "--budget", "60"], stdin=text, tmp=tmp, env={"FAKEFM_RESPOND_MODE": "first-line"})
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertEqual(p.stdout, "[1/2]\n%s\n[2/2]\n%s\n" % ("A" * 100, "C" * 100))
+        responds = [c for c in fm_calls(tmp) if c["cmd"][0] == "respond"]
+        self.assertEqual(responds[0]["stdin"], "A" * 100 + "\n\n" + "B" * 100)
+        self.assertEqual(responds[1]["stdin"], "C" * 100)
+
+    def test_long_paragraph_splits_at_lines(self):
+        tmp = tempfile.mkdtemp()
+        text = "\n".join(["L%d" % i + "x" * 98 for i in range(4)])  # one paragraph, 4 lines of 100 bytes
+        p = run_afm(["ask", "S.", "--chunk", "--budget", "60"], stdin=text, tmp=tmp, env={"FAKEFM_RESPOND_MODE": "first-line"})
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertTrue(p.stdout.startswith("[1/2]\nL0"), p.stdout)
+        responds = [c for c in fm_calls(tmp) if c["cmd"][0] == "respond"]
+        self.assertEqual(len(responds), 2)
+        self.assertEqual(responds[0]["stdin"].count("\n"), 1)
+
+    def test_single_line_over_budget_is_exit_6(self):
+        tmp = tempfile.mkdtemp()
+        text = "short\n\n" + "y" * 1000
+        p = run_afm(["ask", "S.", "--chunk", "--budget", "60"], stdin=text, tmp=tmp)
+        self.assertEqual(p.returncode, 6, p.stderr)
+        self.assertEqual(p.stdout, "")
+        self.assertIn("line 3 is", p.stderr)
+        self.assertIn("budget is 60", p.stderr)
+        self.assertEqual([c for c in fm_calls(tmp) if c["cmd"][0] == "respond"], [])
+
+    def test_too_many_chunks_is_exit_6_before_respond(self):
+        tmp = tempfile.mkdtemp()
+        text = "\n\n".join(["P" * 100] * 5)
+        p = run_afm(["ask", "S.", "--chunk", "--budget", "30", "--max-chunks", "3"], stdin=text, tmp=tmp)
+        self.assertEqual(p.returncode, 6, p.stderr)
+        self.assertIn("input needs 5 chunks, max is 3", p.stderr)
+        self.assertEqual([c for c in fm_calls(tmp) if c["cmd"][0] == "respond"], [])
+
+    def test_middle_piece_failure_stops_with_prefix_and_empty_stdout(self):
+        tmp = tempfile.mkdtemp()
+        text = "\n\n".join(["P" * 100] * 3)
+        p = run_afm(["ask", "S.", "--chunk", "--budget", "30"], stdin=text, tmp=tmp, env={
+            "FAKEFM_RESPOND_FAIL_ON_CALL": "2", "FAKEFM_RESPOND_EXIT": "1",
+            "FAKEFM_RESPOND_STDERR": "Error: The model's safety guardrails were triggered.\n"})
+        self.assertEqual(p.returncode, 1, p.stderr)
+        self.assertEqual(p.stdout, "")
+        self.assertIn("chunk 2/3: ", p.stderr)
+        self.assertIn("guardrails", p.stderr)
+        self.assertEqual(len([c for c in fm_calls(tmp) if c["cmd"][0] == "respond"]), 2)
+
+    def test_schema_chunks_are_json_lines(self):
+        tmp = tempfile.mkdtemp()
+        text = "\n\n".join(["P" * 100] * 2)
+        # classify instructions ~38 tokens + schema ~38 tokens + one paragraph ~26 -> 102; two paragraphs -> 128
+        p = run_afm(["classify", "--labels", "a,b", "--chunk", "--budget", "115"], stdin=text, tmp=tmp,
+                    env={"FAKEFM_RESPOND_STDOUT": '{"label": "a"}'})
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertEqual(p.stdout, '{"label":"a"}\n{"label":"a"}\n')
+
+    def test_over_budget_without_chunk_still_exit_6(self):
+        p = run_afm(["ask", "S.", "--budget", "10"], stdin="z" * 100)
+        self.assertEqual(p.returncode, 6)
+
+
 if __name__ == "__main__":
     unittest.main()

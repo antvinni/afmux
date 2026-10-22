@@ -7,6 +7,7 @@ model unavailable, 5 blocked by a sandbox, 6 input over budget.
 import argparse
 import json
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -225,6 +226,95 @@ def parse_answer(raw, job, schema_path):
     return json.dumps(obj, separators=(",", ":"), ensure_ascii=False)
 
 
+class Unit(object):
+    def __init__(self, text, sep, line):
+        self.text = text
+        self.sep = sep
+        self.line = line
+
+
+def split_units(text):
+    """Paragraphs separated by blank lines, each with its first line number."""
+    units = []
+    line = 1
+    pos = 0
+    for m in re.finditer(r"\n[ \t]*\n+", text):
+        chunk = text[pos:m.start()]
+        units.append(Unit(chunk, "" if not units else "\n\n", line))
+        line += chunk.count("\n") + m.group(0).count("\n")
+        pos = m.end()
+    tail = text[pos:]
+    if tail.strip() or not units:
+        units.append(Unit(tail, "" if not units else "\n\n", line))
+    return units
+
+
+def _explode_lines(unit):
+    out = []
+    for i, ln in enumerate(unit.text.split("\n")):
+        out.append(Unit(ln, unit.sep if i == 0 else "\n", unit.line + i))
+    return out
+
+
+def _join(units):
+    return "".join((u.sep if i else "") + u.text for i, u in enumerate(units))
+
+
+def plan_chunks(text, job, overhead, budget, max_chunks, total_tokens):
+    """Pack units greedily by a byte ratio, confirm each piece with fm count-tokens."""
+    ratio = float(total_tokens) / max(1, len(text.encode()))
+    units = split_units(text)
+    pieces = []
+    i = 0
+    while i < len(units):
+        piece = []
+        nbytes = 0
+        while i < len(units):
+            b = len(units[i].text.encode()) + len(units[i].sep.encode())
+            if piece and (nbytes + b) * ratio + overhead > budget:
+                break
+            piece.append(units[i])
+            nbytes += b
+            i += 1
+        while True:
+            candidate = _join(piece)
+            if count_tokens(candidate, job.instructions) + overhead <= budget:
+                break
+            if len(piece) > 1:
+                piece.pop()
+                i -= 1
+                continue
+            u = piece[0]
+            if "\n" in u.text:
+                units[i - 1:i] = _explode_lines(u)
+                i -= 1
+                piece = []
+                break
+            n = count_tokens(u.text)
+            raise AfmError(EXIT_BUDGET, "line %d is %d tokens, budget is %d" % (u.line, n, budget))
+        if not piece:
+            continue
+        pieces.append(candidate)
+    if len(pieces) > max_chunks:
+        raise AfmError(EXIT_BUDGET, "input needs %d chunks, max is %d" % (len(pieces), max_chunks))
+    return pieces
+
+
+def run_chunks(pieces, job, args, schema_path):
+    n = len(pieces)
+    outputs = []
+    for idx, piece in enumerate(pieces, 1):
+        try:
+            answer = parse_answer(respond(job, piece, args, schema_path), job, schema_path)
+        except AfmError as e:
+            raise AfmError(e.code, "chunk %d/%d: %s" % (idx, n, e.message))
+        if schema_path:
+            outputs.append(answer + "\n")
+        else:
+            outputs.append("[%d/%d]\n%s\n" % (idx, n, answer))
+    return "".join(outputs)
+
+
 def cleanup():
     while _TEMP_FILES:
         path = _TEMP_FILES.pop()
@@ -272,8 +362,12 @@ def main(argv):
         overhead = schema_tokens(schema_path) if schema_path else 0
         total = count_tokens(text, job.instructions) + overhead
         check_budget(total, args.budget, args.chunk)
-        answer = respond(job, text, args, schema_path)
-        emit_text(parse_answer(answer, job, schema_path))
+        if args.chunk:
+            pieces = plan_chunks(text, job, overhead, args.budget, args.max_chunks, total - overhead)
+            sys.stdout.write(run_chunks(pieces, job, args, schema_path))
+        else:
+            answer = respond(job, text, args, schema_path)
+            emit_text(parse_answer(answer, job, schema_path))
         return EXIT_OK
     except AfmError as e:
         sys.stderr.write("afm: %s\n" % e.message)
