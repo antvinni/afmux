@@ -71,7 +71,8 @@ def parse_step(path):
         key = key.strip()
         if not sep or key not in HEADER_KEYS:
             raise AfmError(EXIT_USAGE, "step %s: unknown header line %r (allowed: %s)" % (step_id, line, ", ".join(HEADER_KEYS)))
-        fields[key] = value.strip()
+        value = re.split(r"\s+#", value, maxsplit=1)[0].strip()   # a trailing "  # comment" is allowed
+        fields[key] = value
     if not fields.get("file"):
         raise AfmError(EXIT_USAGE, "step %s: missing 'file:' header (the one file this step writes)" % step_id)
     if not fields.get("test"):
@@ -195,6 +196,18 @@ def build_prompt(step, current, previous=None, test_output=None):
 
 # --- running a step -------------------------------------------------------------
 
+_TEST_COUNT = re.compile(r"Ran (\d+) tests?|(\d+) passed|collected (\d+) items?")
+
+
+def tests_run(output):
+    """How many tests the command reported running, or None if it didn't say."""
+    total = None
+    for m in _TEST_COUNT.finditer(output or ""):
+        n = int(next(g for g in m.groups() if g is not None))
+        total = n if total is None else total + n
+    return total
+
+
 def run_tests(command):
     try:
         p = subprocess.run(command, shell=True, capture_output=True, text=True, timeout=TEST_TIMEOUT)
@@ -265,10 +278,13 @@ def run_step(step, args, earlier=()):
     existed = os.path.isfile(step.file)
     original = read_file(step.file) if existed else None
     if existed:
-        ok, _ = run_tests(step.test)
+        ok, out0 = run_tests(step.test)
         if ok:
             clear_failed(step)
-            return "pass", 0, time.time() - t0, ["already passing, not regenerated"], None
+            notes = ["already passing, not regenerated"]
+            if tests_run(out0) == 0:
+                notes.append("warning: the test command ran 0 tests")
+            return "pass", 0, time.time() - t0, notes, None
     instructions = INSTRUCTIONS % step.file
     previous = output = None
     attempts = 0
@@ -308,6 +324,10 @@ def run_step(step, args, earlier=()):
                 dups = duplicate_definitions(code) if step.file.endswith(".py") else []
                 if dups:
                     notes.append("warning: duplicate top-level definition of %s; the last one wins" % ", ".join(dups))
+                n = tests_run(output)
+                if n == 0:
+                    notes.append("warning: the test command ran 0 tests")
+                notes.append("tests run: %s" % ("unknown" if n is None else n))
                 return "pass", attempts, time.time() - t0, notes, None
             e, eout = broken
             output = ("regression: this step's rewrite of %s broke step %s (test: %s). Keep every existing "
@@ -348,12 +368,23 @@ def report_text(rows, failed):
         att = r["attempts"] if r["result"] != "skipped" else "-"
         secs = ("%.1f" % r["seconds"]) if r["result"] != "skipped" else "-"
         lines.append("%-*s  %-*s  %-7s  %-8s  %s%s" % (w_id, r["id"], w_file, r["file"], r["result"], att, secs, extra))
-    noted = [r for r in rows if r["notes"] and r["attempts"] > 0]
+    noted = [r for r in rows if [n for n in r["notes"] if not n.startswith("tests run:")] and r["attempts"] > 0]
     if noted:
         lines.append("")
         for r in noted:
             for n in r["notes"]:
-                lines.append("%s: %s" % (r["id"], n))
+                if not n.startswith("tests run:"):
+                    lines.append("%s: %s" % (r["id"], n))
+    if not failed:
+        done = [r for r in rows if r["result"] == "pass"]
+        tests = 0
+        for r in done:
+            for n in r["notes"]:
+                if n.startswith("tests run: ") and n[11:].isdigit():
+                    tests += int(n[11:])
+        retries = sum(max(0, r["attempts"] - 1) for r in done)
+        warnings = sum(1 for r in rows for n in r["notes"] if n.startswith("warning"))
+        lines += ["", "%d/%d steps passed, %d tests, %d retries, %d warnings" % (len(done), len(rows), tests, retries, warnings)]
     if failed:
         lines += ["", "step %s failed after %d attempt%s" % (failed["id"], failed["attempts"], "" if failed["attempts"] == 1 else "s"),
                   "test: %s" % failed["test"], head_tail(failed["output"]),
