@@ -1,0 +1,38 @@
+#!/usr/bin/env python3
+"""Claude Code PostToolUse hook: after a large Bash result, suggest piping into afm next time.
+
+settings.json:
+  {"hooks": {"PostToolUse": [{"matcher": "Bash",
+    "hooks": [{"type": "command", "command": "~/.claude/skills/afmux/hooks/nudge-large-output"}]}]}}
+Threshold in tokens: AFMUX_NUDGE_TOKENS (default 3000).
+"""
+import json
+import os
+import sys
+
+
+def main():
+    try:
+        payload = json.load(sys.stdin)
+    except ValueError:
+        return 0
+    if payload.get("tool_name") != "Bash":
+        return 0
+    resp = payload.get("tool_response", "")
+    if isinstance(resp, dict):
+        text = "".join(str(resp.get(k, "")) for k in ("stdout", "stderr", "output"))
+    else:
+        text = str(resp)
+    tokens = len(text) // 4
+    threshold = int(os.environ.get("AFMUX_NUDGE_TOKENS", "3000"))
+    if tokens < threshold:
+        return 0
+    msg = ("That command output was about %d tokens. If you only needed a digest, a label "
+           "or a few fields from it, next time pipe it into afm instead of reading it "
+           "(see the afmux skill)." % tokens)
+    print(json.dumps({"hookSpecificOutput": {"hookEventName": "PostToolUse", "additionalContext": msg}}))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
