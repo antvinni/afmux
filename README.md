@@ -1,5 +1,7 @@
 # afmux
 
+> Write-up: [Can Apple's on-device model save my coding agent tokens?](https://antvinni.pages.dev/blog/afmux/) No :) One day, eight experiments with afmux and the macOS 27 `fm` tool.
+
 afmux puts Apple's free on-device Foundation Model to work for coding agents (Claude Code, Codex, OpenCode) in two ways. `afm read` answers a question about a long file from verified quotes, so the agent never reads the file into its context. `afm run` implements test-gated steps from the agent's specs and tests, and reports back once.
 
 The agent breaks a task into small test-gated steps and writes each step's spec and tests; `afm run` implements each step locally, runs its tests, retries once, and reports back once.
