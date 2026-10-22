@@ -150,9 +150,10 @@ order:
    Purpose. Input must be redirected or piped; `afm` exits at once if stdin
    is a terminal.
 6. The exit codes and what to do on each. Exit 5 means the agent's sandbox
-   blocked the model: run `afm` outside the sandbox (Claude Code: add it to
-   the sandbox exclusions; Codex: run with sandbox disabled for that command)
-   and never retry inside it. Exit 1 on `classify` or `extract` may be a
+   blocked the model: rerun the same command outside the sandbox (Claude
+   Code: retry with `dangerouslyDisableSandbox: true`, since an
+   `excludedCommands` entry does not cover a pipe or redirect; Codex: request
+   escalation) and never retry inside it. Exit 1 on `classify` or `extract` may be a
    content-specific guardrail refusal of that schema; the fallback is one
    copyable line:
    `afm ask "Answer only as JSON with keys a, b, c." < same-input`
@@ -212,6 +213,11 @@ through one function with one failure policy:
   Matching the two tokens rather than the sentence avoids the curly
   apostrophe and survives rewording.
 - Any other non-zero exit: handled by the caller as described below.
+- Every call runs under `--timeout`, not only `respond`. ANSI colour codes
+  are stripped from `fm` stderr before it is passed through. Instructions
+  are passed as `--instructions=<text>` so text starting with `-` works.
+  A user schema is checked before any call: it must parse as JSON and carry
+  `x-order`, otherwise exit 2.
 
 #### Behaviour, in order
 
@@ -231,7 +237,9 @@ through one function with one failure policy:
    high. A `count-tokens` failure that is not exit 4 or 5 is exit 1 with its
    stderr passed through. If the sum exceeds the budget: without `--chunk`,
    exit 6 with `input is N tokens, budget is M; rerun with --chunk` on
-   stderr; with `--chunk`, go to Chunking. Never truncate.
+   stderr (for `commit-msg`, the advice is to pipe a smaller diff instead);
+   with `--chunk`, go to Chunking. Never truncate. Input is read as UTF-8
+   with invalid bytes replaced, and CRLF is normalised to LF.
 4. Run `fm respond --no-stream --greedy -i <instructions> --guardrails L
    --use-case C [--schema FILE]` with the input on stdin, under the timeout.
    The child stays in afm's own process group, so a signal to the group
@@ -271,10 +279,14 @@ option would force it back to reading everything.
    (input plus instructions plus schema, as in step 3). If a piece is over
    budget, move its last paragraph to the next piece and recount.
 2. A single paragraph over budget is split at line boundaries. A single line
-   over budget is exit 6 with `line N is M tokens, budget is B`.
+   over budget is exit 6 with `line N is M tokens plus F for instructions and
+   schema, budget is B`.
 3. If the input needs more than `--max-chunks` pieces, exit 6 with
-   `input needs P chunks, max is N` before any `respond` call. Splitting is
-   not truncation; afm never drops input.
+   `input needs more than N chunks, max is N` before any `respond` call;
+   planning stops as soon as piece N+1 is confirmed, so a huge input does not
+   pay for a full plan. Splitting is not truncation: afm never drops text,
+   only whitespace-only paragraphs and lines, which the model rejects as an
+   empty prompt.
 4. Run one `fm respond` per piece, in order, one at a time (the device
    serialises anyway). `--timeout` applies to each call.
 5. If any piece fails, stop, print nothing on stdout, and exit with that

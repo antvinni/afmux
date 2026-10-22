@@ -40,7 +40,7 @@ would have been.
     afm extract --schema s.json < build.log
     tail -n 400 app.log | afm classify --labels outage,degraded,normal
 
-Presets: `summarise`, `classify --labels a,b,c` (returns `{"label": ...}`),
+Presets: `summarise`, `classify --labels a,b,c` (returns `{"label": ...}`; labels are plain words, no commas, quotes or backslashes),
 `extract --schema FILE` (flat JSON), `commit-msg`. Input must be piped or
 redirected; `afm` exits at once if stdin is a terminal. Schema files for
 `extract` come from `fm schema object --name X --string a --integer b`.
@@ -54,7 +54,7 @@ redirected; `afm` exits at once if stdin is a terminal. Schema files for
 | 2 | usage error; reason on stderr | fix the call |
 | 3 | output was not valid JSON or label not in list; raw output on stderr | do it yourself; a retry gives the same output |
 | 4 | `fm` missing or model unavailable | do it yourself; do not retry |
-| 5 | blocked by your sandbox | run `afm` outside the sandbox (Claude Code: sandbox exclusion; Codex: sandbox off for that command). Never retry inside it |
+| 5 | blocked by your sandbox | rerun the same command outside the sandbox: Claude Code: retry with `dangerouslyDisableSandbox: true`; Codex: request sandbox escalation for the command. Never retry inside the sandbox |
 | 6 | input over budget; numbers on stderr | rerun with `--chunk` (`summarise`, `classify`, `extract`, `ask`), then merge the per-chunk answers. `commit-msg` does not chunk: pipe a smaller view: `{ git diff --cached --stat; git diff --cached -U1; } \| afm commit-msg`, and on a second exit 6 write it yourself |
 
 With `--chunk`, output is `[i/n]` headers with one answer each, or one JSON

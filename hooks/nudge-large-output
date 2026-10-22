@@ -24,7 +24,10 @@ def main():
     else:
         text = str(resp)
     tokens = len(text) // 4
-    threshold = int(os.environ.get("AFMUX_NUDGE_TOKENS", "3000"))
+    try:
+        threshold = int(os.environ.get("AFMUX_NUDGE_TOKENS", "3000"))
+    except ValueError:
+        threshold = 3000
     if tokens < threshold:
         return 0
     msg = ("That command output was about %d tokens. If you only needed a digest, a label "

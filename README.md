@@ -74,9 +74,11 @@ sandbox.
 Two documented limits of `excludedCommands` matter here: every command in
 the call must match, and a redirect or command substitution keeps the whole
 call sandboxed. So `pytest 2>&1 | afm ask "..."` and `afm summarise <
-build.log` still run sandboxed. When that happens `afm` exits 5 and Claude
-can retry the call unsandboxed (the prompt is titled "Bash command
-(unsandboxed)"; in auto and bypass modes it runs without a prompt). See
+build.log` still run sandboxed even with the entry above, which only helps
+calls like `afm --list`. When a call is sandboxed, `afm` exits 5 and the
+skill tells Claude to rerun the same command with `dangerouslyDisableSandbox:
+true`; the prompt is titled "Bash command (unsandboxed)", and in auto and
+bypass modes it runs without a prompt. See
 [Sandboxing](https://code.claude.com/docs/en/sandboxing).
 
 **Codex.** Codex has no per-command exclusion. Either approve the sandbox

@@ -37,6 +37,11 @@ class HookTests(unittest.TestCase):
         p = run_hook({"tool_name": "Read", "tool_response": "x" * 20000})
         self.assertEqual(p.stdout, "")
 
+    def test_bad_threshold_env_falls_back_to_default(self):
+        p = run_hook({"tool_name": "Bash", "tool_response": "x" * 20000}, env={"AFMUX_NUDGE_TOKENS": "lots"})
+        self.assertEqual(p.returncode, 0)
+        self.assertIn("afm", p.stdout)
+
     def test_bad_json_is_silent(self):
         p = subprocess.run([sys.executable, HOOK], input="not json", capture_output=True, text=True)
         self.assertEqual(p.returncode, 0)
