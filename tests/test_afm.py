@@ -782,6 +782,56 @@ class ReadTests(unittest.TestCase):
         self.assertIn("boom", p.stderr)
 
 
+class ReadFixTests(unittest.TestCase):
+    NOT_FOUND = json.dumps({"found": False, "quote": ""})
+
+    def test_paragraph_larger_than_a_chunk_is_split_at_lines(self):
+        pr = Project()
+        log = "\n".join("2026-10-22 INFO line %d of a log with no blank lines" % i for i in range(1, 401))
+        pr.write("app.log", log)
+        for _ in range(200):
+            pr.reply(self.NOT_FOUND)
+        p = pr.run(["read", "app.log", "--ask", "q", "--chunk-tokens", "500"])
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        chunks = [r["stdin"].split("---\n", 1)[1] for r in pr.responds()]
+        self.assertGreater(len(chunks), 4)
+        self.assertTrue(pr.responds()[0]["stdin"].startswith("Chunk lines 1-"))
+        self.assertEqual("\n".join(chunks), log)
+
+    def test_line_longer_than_a_chunk_is_split(self):
+        pr = Project()
+        pr.write("min.json", "x" * 20000 + "\n")
+        for _ in range(200):
+            pr.reply(self.NOT_FOUND)
+        p = pr.run(["read", "min.json", "--ask", "q", "--chunk-tokens", "500"])
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        chunks = [r["stdin"].split("---\n", 1)[1] for r in pr.responds()]
+        self.assertGreater(len(chunks), 4)
+        self.assertEqual("".join(chunks), "x" * 20000)
+
+    def test_one_failed_chunk_does_not_end_the_read(self):
+        pr = Project()
+        pr.write("doc.md", DOC)
+        for _ in range(40):
+            pr.reply(json.dumps({"found": True, "quote": "turned on with the enabled key"}))
+        p = pr.run(["read", "doc.md", "--ask", "q", "--chunk-tokens", "200"], env={
+            "FAKEFM_RESPOND_FAIL_ON_CALL": "1", "FAKEFM_RESPOND_EXIT": "1",
+            "FAKEFM_RESPOND_STDERR": "Error: The model's safety guardrails were triggered.\n"})
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertIn("1 failed: chunk lines 1-1", p.stdout)
+        self.assertIn("enabled key", p.stdout)
+        d = json.loads(pr.run(["read", "doc.md", "--ask", "q", "--chunk-tokens", "200", "--json"]).stdout)
+        self.assertNotIn("failed", d, "the second run has no failures, so no failed key")
+
+    def test_quote_is_cited_by_its_own_lines(self):
+        pr = Project()
+        pr.write("notes.md", "intro line\nsecond line\nthe key fact is here\nlast line\n")
+        pr.reply(json.dumps({"found": True, "quote": "the key fact is here"}))
+        p = pr.run(["read", "notes.md", "--ask", "q"])
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertIn('[lines 3-3] "the key fact is here"', p.stdout)
+
+
 class SignalTests(unittest.TestCase):
     def test_sigterm_kills_child(self):
         pr = Project()

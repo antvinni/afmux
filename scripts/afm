@@ -485,7 +485,7 @@ def chunk_document(text, chunk_tokens, total_tokens):
 
     Returns a list of (text, first_line, last_line)."""
     ratio = float(max(1, total_tokens)) / max(1, len(text.encode()))
-    units = split_units(text)
+    units = _fit_units(split_units(text), chunk_tokens, ratio)
     chunks = []
     cur, cur_bytes, first = [], 0, None
     for u in units:
@@ -502,6 +502,46 @@ def chunk_document(text, chunk_tokens, total_tokens):
     return chunks
 
 
+def _fit_units(units, chunk_tokens, ratio):
+    """Split any unit bigger than one chunk: a paragraph into its lines, a line into pieces.
+
+    Without this a file with no blank lines (most logs) is a single chunk and overflows the context."""
+    out = []
+    for u in units:
+        if (len(u.text.encode()) + 2) * ratio <= chunk_tokens:
+            out.append(u)
+            continue
+        for i, ln in enumerate(u.text.split("\n")):
+            sep = u.sep if i == 0 else "\n"
+            limit = max(1, int(chunk_tokens / ratio))          # bytes per piece
+            if len(ln.encode()) <= limit:
+                out.append(Unit(ln, sep, u.line + i))
+                continue
+            for k in range(0, len(ln), limit):                  # characters, close enough to bytes for a cut
+                out.append(Unit(ln[k:k + limit], sep if k == 0 else "", u.line + i))
+    return out
+
+
+def quote_lines(quote, ctext, first, last):
+    """The smallest run of the chunk's lines that contains the quote, as "a-b"."""
+    lines = [_norm(ln) for ln in ctext.split("\n")]
+    q = _norm(quote)
+    best = None
+    for start in range(len(lines)):
+        joined = ""
+        for end in range(start, len(lines)):
+            joined = (joined + " " + lines[end]).strip() if lines[end] else joined
+            if q in joined:
+                if best is None or end - start < best[1] - best[0]:
+                    best = (start, end)
+                break
+            if best is not None and end - start >= best[1] - best[0]:
+                break
+    if best is None:
+        return "%d-%d" % (first, last)
+    return "%d-%d" % (first + best[0], first + best[1])
+
+
 def _norm(text):
     return re.sub(r"\s+", " ", text).strip().lower()
 
@@ -514,7 +554,7 @@ def read_file_answers(path, question, args):
     chunks = chunk_document(text, args.chunk_tokens, total)
     schema_path = write_temp_schema(READ_SCHEMA)
     instructions = READ_INSTRUCTIONS % question.strip()
-    answers, dropped = [], 0
+    answers, dropped, failed, first_failure = [], 0, 0, None
     for ctext, first, last in chunks:
         prompt = "Chunk lines %d-%d of %s\n---\n%s" % (first, last, os.path.basename(path), ctext)
         code, out, err = run_fm(["respond", "--no-stream", "--greedy", "--instructions=" + instructions, "--schema", schema_path],
@@ -523,7 +563,11 @@ def read_file_answers(path, question, args):
             acode, _, aerr = run_fm(["available"], "")
             if acode != 0:
                 raise AfmError(EXIT_UNAVAILABLE, aerr.strip() or "model not available")
-            raise AfmError(EXIT_FAIL, "chunk lines %d-%d: %s" % (first, last, err.strip() or "fm respond failed"))
+            # one refused or failed chunk does not end the read; only all of them failing does
+            failed += 1
+            if first_failure is None:
+                first_failure = "chunk lines %d-%d: %s" % (first, last, err.strip() or "fm respond failed")
+            continue
         try:
             obj = json.loads(out)
         except ValueError:
@@ -535,22 +579,30 @@ def read_file_answers(path, question, args):
         if not quote.strip() or _norm(quote) not in _norm(ctext):
             dropped += 1
             continue
-        answers.append({"lines": "%d-%d" % (first, last), "quote": quote.strip()})
-    return {"file": path, "question": question, "chunks": len(chunks), "tokens": total, "dropped": dropped, "answers": answers}
+        answers.append({"lines": quote_lines(quote, ctext, first, last), "quote": quote.strip()})
+    if chunks and failed == len(chunks):
+        raise AfmError(EXIT_FAIL, first_failure)
+    res = {"file": path, "question": question, "chunks": len(chunks), "tokens": total, "dropped": dropped}
+    if failed:
+        res["failed"] = failed
+        res["first_failure"] = first_failure
+    res["answers"] = answers
+    return res
 
 
 def report_read(res, as_json):
     if as_json:
         return json.dumps(res, indent=1, ensure_ascii=False) + "\n"
+    tail = ", %d dropped: quote not in text" % res["dropped"] if res["dropped"] else ""
+    if res.get("failed"):
+        tail += ", %d failed: %s" % (res["failed"], res["first_failure"])
     lines = []
     if res["answers"]:
-        lines.append("%d of %d chunks matched (%d tokens read locally%s)" % (
-            len(res["answers"]), res["chunks"], res["tokens"], ", %d dropped: quote not in text" % res["dropped"] if res["dropped"] else ""))
+        lines.append("%d of %d chunks matched (%d tokens read locally%s)" % (len(res["answers"]), res["chunks"], res["tokens"], tail))
         for a in res["answers"]:
             lines.append("[lines %s] \"%s\"" % (a["lines"], a["quote"]))
     else:
-        lines.append("no chunk matched the question (%d chunks, %d tokens read locally%s)" % (
-            res["chunks"], res["tokens"], ", %d dropped: quote not in text" % res["dropped"] if res["dropped"] else ""))
+        lines.append("no chunk matched the question (%d chunks, %d tokens read locally%s)" % (res["chunks"], res["tokens"], tail))
     return "\n".join(lines) + "\n"
 
 
