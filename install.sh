@@ -78,21 +78,27 @@ add_rule() {  # add_rule FILE
 
 if [ "$have_claude" = 1 ]; then
   python3 - "$HOME/.claude/settings.json" <<'PY'
-import json, os, sys
+import json, os, shutil, sys
 path = sys.argv[1]
-try:
-    with open(path) as f:
-        cfg = json.load(f)
-except (OSError, ValueError):
-    cfg = {}
+cfg = {}
+if os.path.exists(path):
+    try:
+        with open(path) as f:
+            cfg = json.load(f)
+    except ValueError as e:
+        sys.exit("afmux install: %s is not valid JSON (%s); fix it or add \"afm *\" to sandbox.excludedCommands yourself" % (path, e))
+if not isinstance(cfg, dict):
+    sys.exit("afmux install: %s is not a JSON object; add \"afm *\" to sandbox.excludedCommands yourself" % path)
 sb = cfg.setdefault("sandbox", {})
 ex = sb.setdefault("excludedCommands", [])
 if "afm *" not in ex:
     ex.append("afm *")
+    if os.path.exists(path):
+        shutil.copy2(path, path + ".afmux-backup")
     with open(path, "w") as f:
         json.dump(cfg, f, indent=2)
         f.write("\n")
-    print("added 'afm *' to sandbox.excludedCommands in " + path)
+    print("added 'afm *' to sandbox.excludedCommands in " + path + (" (backup: " + path + ".afmux-backup)" if os.path.exists(path + ".afmux-backup") else ""))
 PY
   add_rule "$HOME/.claude/CLAUDE.md"
 fi
@@ -103,16 +109,22 @@ fi
 
 if [ "$have_opencode" = 1 ]; then
   python3 - "$HOME/.config/opencode/opencode.json" <<'PY'
-import json, os, sys
+import json, os, shutil, sys
 path = sys.argv[1]
-try:
-    with open(path) as f:
-        cfg = json.load(f)
-except (OSError, ValueError):
-    cfg = {"$schema": "https://opencode.ai/config.json"}
+cfg = {"$schema": "https://opencode.ai/config.json"}
+if os.path.exists(path):
+    try:
+        with open(path) as f:
+            cfg = json.load(f)
+    except ValueError as e:
+        sys.exit("afmux install: %s is not valid JSON (%s); fix it or allow \"afm *\" under permission.shell yourself" % (path, e))
+if not isinstance(cfg, dict):
+    sys.exit("afmux install: %s is not a JSON object; allow \"afm *\" under permission.shell yourself" % path)
 shell = cfg.setdefault("permission", {}).setdefault("shell", {})
 if shell.get("afm *") != "allow":
     shell["afm *"] = "allow"
+    if os.path.exists(path):
+        shutil.copy2(path, path + ".afmux-backup")
     with open(path, "w") as f:
         json.dump(cfg, f, indent=2)
         f.write("\n")
