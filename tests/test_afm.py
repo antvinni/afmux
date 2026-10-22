@@ -145,6 +145,31 @@ class UsageTests(unittest.TestCase):
         pr.step("01-a", context="nothere.py")
         self.assert_usage(pr.run(["run", "steps"]), "nothere.py")
 
+    def test_context_produced_by_an_earlier_step_is_accepted(self):
+        pr = Project()
+        pr.write("test_util.py", SLUGIFY_TESTS)
+        pr.step("01-a", file="first.py", test="true")
+        pr.step("02-b", file="util.py", context="first.py")
+        pr.reply("# first\n")
+        pr.reply(GOOD_SLUGIFY)
+        p = pr.run(["run", "steps"])
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertIn("# first", pr.responds()[1]["stdin"])
+
+    def test_context_from_a_later_step_is_rejected(self):
+        pr = Project()
+        pr.step("01-a", file="util.py", context="later.py")
+        pr.step("02-b", file="later.py", test="true")
+        self.assert_usage(pr.run(["run", "steps"]), "later.py")
+
+    def test_help_usage_line_is_not_doubled(self):
+        p = Project().run(["--help"])
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertTrue(p.stdout.startswith("usage: afm "), p.stdout[:60])
+        self.assertNotIn("usage: usage:", p.stdout)
+        self.assertIn("--retries", p.stdout)
+        self.assertIn("file:", p.stdout)
+
     def test_bad_retries(self):
         pr = Project()
         pr.step("01-a")
@@ -263,12 +288,11 @@ class SingleStepTests(unittest.TestCase):
 
     def test_steps_run_in_filename_order(self):
         pr = Project()
-        pr.write("test_util.py", SLUGIFY_TESTS)
-        pr.step("02-second", spec="SECOND")
-        pr.step("01-first", spec="FIRST")
-        pr.step("10-tenth", spec="TENTH")
+        pr.step("02-second", spec="SECOND", file="second.py", test="true")
+        pr.step("01-first", spec="FIRST", file="first.py", test="true")
+        pr.step("10-tenth", spec="TENTH", file="tenth.py", test="true")
         for _ in range(3):
-            pr.reply(GOOD_SLUGIFY)
+            pr.reply("x = 1\n")
         p = pr.run(["run", "steps"])
         self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
         specs = [r["stdin"] for r in pr.responds()]
@@ -339,24 +363,23 @@ class RetryAndFailureTests(unittest.TestCase):
         pr = Project()
         pr.write("test_util.py", SLUGIFY_TESTS)
         pr.step("01-a")
-        pr.step("02-b", spec="SECOND")
-        pr.step("03-c", spec="THIRD")
+        pr.step("02-b", spec="SECOND", file="b.py", test="python3 -c \"import b; assert b.OK\"")
+        pr.step("03-c", spec="THIRD", file="c.py", test="true")
         pr.reply(GOOD_SLUGIFY)
-        pr.reply(BAD_SLUGIFY)
-        pr.reply(BAD_SLUGIFY)
-        pr.reply(GOOD_SLUGIFY)
+        pr.reply("OK = False\n")
+        pr.reply("OK = False\n")
+        pr.reply("x = 1\n")
         p = pr.run(["run", "steps"])
-        self.assertEqual(p.returncode, 1)
+        self.assertEqual(p.returncode, 1, p.stdout + p.stderr)
         self.assertEqual(len(pr.responds()), 3)
         self.assertIn("03-c", p.stdout)
         self.assertIn("skipped", p.stdout)
-        d = json.loads(pr.run(["run", "steps", "--json"]).stdout) if False else None
 
     def test_json_report_on_failure(self):
         pr = Project()
         pr.write("test_util.py", SLUGIFY_TESTS)
         pr.step("01-a")
-        pr.step("02-b", spec="SECOND")
+        pr.step("02-b", spec="SECOND", file="b.py", test="true")
         pr.reply(BAD_SLUGIFY)
         pr.reply(BAD_SLUGIFY)
         p = pr.run(["run", "steps", "--json"])
@@ -429,6 +452,93 @@ class RetryAndFailureTests(unittest.TestCase):
         p = pr.run(["run", "steps"])
         self.assertEqual(p.returncode, 1)
         self.assertIn("boom", p.stdout)
+
+
+class RerunTests(unittest.TestCase):
+    def test_step_whose_test_already_passes_is_skipped(self):
+        pr = Project()
+        pr.write("test_util.py", SLUGIFY_TESTS)
+        pr.write("util.py", GOOD_SLUGIFY)
+        pr.step("01-slugify")
+        p = pr.run(["run", "steps"])
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertEqual(pr.responds(), [])
+        self.assertIn("already", p.stdout)
+        self.assertEqual(json.loads(pr.run(["run", "steps", "--json"]).stdout)["steps"][0]["attempts"], 0)
+
+    def test_rerun_after_fix_skips_passed_steps(self):
+        pr = Project()
+        pr.write("test_util.py", SLUGIFY_TESTS)
+        pr.step("01-a")
+        pr.step("02-b", file="other.py", test="python3 -c \"import other; assert other.X == 1\"")
+        pr.reply(GOOD_SLUGIFY)
+        pr.reply("X = 2\n")
+        pr.reply("X = 2\n")
+        p = pr.run(["run", "steps"])
+        self.assertEqual(p.returncode, 1, p.stdout + p.stderr)
+        pr.reply("X = 1\n")
+        p = pr.run(["run", "steps"])
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertEqual(len(pr.responds()), 4, "step 01 must not be regenerated on the rerun")
+        self.assertEqual(pr.read("other.py"), "X = 1\n")
+
+    def test_hand_written_step_is_left_alone(self):
+        pr = Project()
+        pr.write("test_util.py", SLUGIFY_TESTS)
+        pr.write("util.py", GOOD_SLUGIFY + "# by hand\n")
+        pr.step("01-slugify")
+        pr.run(["run", "steps"])
+        self.assertIn("# by hand", pr.read("util.py"))
+
+
+class ReportDetailTests(unittest.TestCase):
+    def test_retried_pass_reports_why_the_first_attempt_failed(self):
+        pr = Project()
+        pr.write("test_util.py", SLUGIFY_TESTS)
+        pr.step("01-slugify")
+        pr.reply(BAD_SLUGIFY)
+        pr.reply(GOOD_SLUGIFY)
+        p = pr.run(["run", "steps"])
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertIn("attempt 1 failed", p.stdout)
+        self.assertIn("test_basic", p.stdout)
+        d = json.loads(pr.run(["run", "steps", "--json"]).stdout)
+        self.assertEqual(d["steps"][0]["result"], "pass")
+
+    def test_stale_failed_attempt_is_removed_on_pass(self):
+        pr = Project()
+        pr.write("test_util.py", SLUGIFY_TESTS)
+        pr.write("util.py.afm-failed", "old\n")
+        pr.write("util.py.afm-failed.log", "old\n")
+        pr.step("01-slugify")
+        pr.reply(GOOD_SLUGIFY)
+        p = pr.run(["run", "steps"])
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertFalse(pr.exists("util.py.afm-failed"))
+        self.assertFalse(pr.exists("util.py.afm-failed.log"))
+
+    def test_failure_keeps_full_log_and_shows_head_and_tail(self):
+        pr = Project()
+        lines = "\\n".join("line %03d" % i for i in range(200))
+        pr.step("01-x", test="python3 -c \"print('%s'); raise SystemExit(1)\"" % lines)
+        pr.reply("x = 1\n")
+        pr.reply("x = 1\n")
+        p = pr.run(["run", "steps"])
+        self.assertEqual(p.returncode, 1)
+        self.assertIn("line 000", p.stdout)
+        self.assertIn("line 199", p.stdout)
+        self.assertIn("lines omitted", p.stdout)
+        self.assertIn("line 100", pr.read("util.py.afm-failed.log"))
+        self.assertIn("util.py.afm-failed.log", p.stdout)
+
+    def test_removed_message_says_it_did_not_exist(self):
+        pr = Project()
+        pr.write("test_util.py", SLUGIFY_TESTS)
+        pr.step("01-slugify")
+        pr.reply(BAD_SLUGIFY)
+        pr.reply(BAD_SLUGIFY)
+        p = pr.run(["run", "steps"])
+        self.assertIn("did not exist before", p.stdout)
 
 
 class SignalTests(unittest.TestCase):
